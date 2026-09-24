@@ -8,6 +8,155 @@
 //
 // Everything here is NCHW, except `mx_gate_mm` and `mx_block_perm`, which work on
 // the *blocked* layout MAXIM's gMLP layers are written in.
+//
+// Several of these exist as TILED versions of a toolkit kernel (`mx_conv1x1_t`
+// for `lg_conv1x1`, `mx_conv3x3_t2`/`_t4` for `lg_conv3x3s1p1`, `mx_gate_mm_t0`/
+// `_t1` for `mx_gate_mm`). The originals are all still linked and still launched
+// with `--legacy-ops`, which is how each speedup below is measured rather than
+// asserted: the tiled form shares one load across several outputs, and the
+// originals gave every output element its own thread and re-read everything.
+
+// 3x3 pad-1 conv, tiled: this engine's replacement for the toolkit's
+// `lg_conv3x3s1p1`, which the model still links for the legacy path.
+//
+// That kernel gives each output element its own thread, so per output it issues
+// 9*c_in loads of the input and 9*c_in of the weight - about 1 MAC per 8 bytes
+// moved - and at 512x512 this family is the largest remaining share of the run
+// (1.90 s of 4.32 s, ~1.3 TFLOP/s against this card's 8.9). Here a 64-pixel block
+// of outputs is computed from a shared-memory tile, so one input load feeds 64
+// outputs and one weight load 64 more: ~47 MACs per load.
+//
+// The pixel block is a SEGMENT OF ONE ROW, which is what makes the halo cheap: 64
+// outputs need 66 input columns per (ci, row), so a 3x3 window is three offsets
+// into the same tile rather than three separate loads. `wd % 64 == 0` is required
+// (the host falls back to the toolkit kernel otherwise) and holds for every
+// feature map this model builds, because the plan pads the input to a multiple of
+// 64 and every level halves from there.
+//
+// `PXT` (pixels per thread, 4 or 2) picks the block shape and hence the number of
+// output channels per block: 4 -> 16x16 threads and 64 channels, 2 -> 32x8 and 32.
+// The host picks by `c_out` so that a 32-channel layer does not run with half the
+// block idle.
+//
+// Accumulation order is dy, dx, ci - the same as the toolkit kernel and the CPU
+// twin, which makes the tiled and legacy forms agree bit-for-bit rather than
+// merely within tolerance.
+constexpr int C3_CI = 8;   // input channels per K chunk
+
+template <int PXT>
+__device__ __forceinline__ void c3_body(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd)
+{
+    constexpr int TX = 64 / PXT;            // threads along x
+    constexpr int TY = 256 / TX;            // threads along y
+    constexpr int LOC = TY * 4;             // output channels per block
+    constexpr int PX = 64;                  // output pixels per block
+    constexpr int XW = PX + 2;              // input columns: 64 outputs + halo
+    constexpr int XP = XW + 1;              // padded row stride (odd)
+
+    const int oc0 = blockIdx.x * LOC;
+    const int per_row = wd / PX;
+    const int y0 = blockIdx.y / per_row;
+    const int x0 = (blockIdx.y % per_row) * PX;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * TX + tx;
+    const size_t plane = (size_t)h * wd;
+
+    // [oc][(dy*3 + dx)*C3_CI + ci], row-padded so the strided reads below do not
+    // put two threads in the same bank.
+    __shared__ float sw[LOC * (C3_CI * 9 + 1)];
+    // [ci][dy][column], where column 0 is input x0 - 1.
+    __shared__ float sx[C3_CI * 3 * XP];
+
+    float acc[4][PXT];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float b = (bias && oc0 + ty * 4 + i < c_out) ? bias[oc0 + ty * 4 + i] : 0.0f;
+        #pragma unroll
+        for (int j = 0; j < PXT; ++j) acc[i][j] = b;
+    }
+
+    for (int ci0 = 0; ci0 < c_in; ci0 += C3_CI) {
+        // Weight tile, one element per thread per pass.
+        for (int i = tid; i < LOC * C3_CI * 9; i += 256) {
+            const int oc = i / (C3_CI * 9);
+            const int t = i % (C3_CI * 9);
+            const int dy = t / (3 * C3_CI), dx = (t / C3_CI) % 3, ci = t % C3_CI;
+            const int goc = oc0 + oc, gci = ci0 + ci;
+            float v = 0.0f;
+            if (goc < c_out && gci < c_in) v = w[((size_t)goc * c_in + gci) * 9 + dy * 3 + dx];
+            sw[oc * (C3_CI * 9 + 1) + t] = v;
+        }
+        // Input tile, halo included; out-of-range reads are zeros, which is the
+        // same arithmetic as the toolkit kernel's `continue` on a bounds test.
+        for (int i = tid; i < C3_CI * 3 * XW; i += 256) {
+            const int ci = i / (3 * XW);
+            const int r = i % (3 * XW);
+            const int dy = r / XW, col = r % XW;
+            const int iy = y0 + dy - 1, ix = x0 + col - 1;
+            const int gci = ci0 + ci;
+            float v = 0.0f;
+            if (gci < c_in && iy >= 0 && iy < h && ix >= 0 && ix < wd)
+                v = in[(size_t)gci * plane + (size_t)iy * wd + ix];
+            sx[(ci * 3 + dy) * XP + col] = v;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int dy = 0; dy < 3; ++dy) {
+            #pragma unroll
+            for (int ci = 0; ci < C3_CI; ++ci) {
+                // The PXT + 2 inputs this thread's pixels need, for every one of
+                // the three taps: one load per column instead of one per tap.
+                float xv[PXT + 2];
+                #pragma unroll
+                for (int j = 0; j < PXT + 2; ++j)
+                    xv[j] = sx[(ci * 3 + dy) * XP + tx * PXT + j];
+                #pragma unroll
+                for (int dx = 0; dx < 3; ++dx) {
+                    float wv[4];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        wv[i] = sw[(ty * 4 + i) * (C3_CI * 9 + 1) + (dy * 3 + dx) * C3_CI + ci];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        #pragma unroll
+                        for (int j = 0; j < PXT; ++j) acc[i][j] += wv[i] * xv[dx + j];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        if (oc0 + ty * 4 + i >= c_out) continue;
+        const size_t row = (size_t)(oc0 + ty * 4 + i) * plane + (size_t)y0 * wd + x0 + tx * PXT;
+        #pragma unroll
+        for (int j = 0; j < PXT; ++j) out[row + j] = acc[i][j];
+    }
+}
+
+// 4 pixels per thread: 64 output channels per block, 16x16 threads.
+extern "C" __global__ void mx_conv3x3_t4(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd)
+{
+    c3_body<4>(in, w, bias, out, c_in, c_out, h, wd);
+}
+
+// 2 pixels per thread: 32 channels per block, 32x8 threads, for c_out < 64.
+extern "C" __global__ void mx_conv3x3_t2(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd)
+{
+    c3_body<2>(in, w, bias, out, c_in, c_out, h, wd);
+}
 
 // 1x1 conv over a TRANSPOSED weight, `[c_in][c_out]` - this engine's own
 // replacement for the toolkit's `lg_conv1x1`, which the model still links.
@@ -187,6 +336,197 @@ extern "C" __global__ void mx_gate_mm(
         for (int s = 0; s < inner; ++s) acc += wa[s] * x[s];
         out[idx] = acc;
     }
+}
+
+// The gated-MLP matmul again, this time as an implicit GEMM over a shared-memory
+// tile. `mx_gate_mm` above gives each output element its own thread, so every
+// output re-reads its whole input row and its whole weight row: at 512x512 this
+// family is the largest single share of the run (2.13 s of 5.97 s) and it runs at
+// ~101 GFLOP/s, about 1% of this card's fp32 peak.
+//
+// Both modes are the same GEMM, which is why one body covers them:
+//
+//   mode 1: K = inner (contiguous in the activation), B = c*outer
+//   mode 0: K = outer, B = c*inner - and there the activation's contiguous axis
+//           is B, not K
+//
+// so `in` is the same matrix in the other storage order: [B][K] row-major in
+// mode 1, and [K][B] (that is, [B][K] transposed) in mode 0. The weight is [A][K]
+// with K contiguous in both, where A is the axis the Dense replaces. The tile is
+// therefore FILLED differently per mode and READ back through one index helper,
+// so the compute loop - and hence the accumulation order over K - is the same for
+// both. A == K in this model (the gating Dense is square and replaces the axis it
+// reduces), but the two are kept apart because that is what the indexing needs.
+//
+// Tile: 64 (A) x 64 (B), K in chunks of 16, 256 threads each accumulating a 4x4
+// register block. Strides are padded (65 and 17, both odd) so that neither the
+// stride-4 tile writes nor the stride-1 tile reads put two threads in one bank.
+constexpr int MMA = 64;   // A tile
+constexpr int MMB = 64;   // B tile
+constexpr int MMK = 16;   // K chunk
+
+// The (b, k) slot of the activation tile, per storage order.
+template <int MODE0>
+__device__ __forceinline__ int mm_sx(int b, int k) {
+    return MODE0 ? (k * (MMB + 1) + b) : (b * (MMK + 1) + k);
+}
+
+template <int MODE0>
+__device__ __forceinline__ void mm_body(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c, int outer, int inner)
+{
+    const int A = MODE0 ? outer : inner;
+    const int K = MODE0 ? outer : inner;
+    const int B = MODE0 ? c * inner : c * outer;
+
+    const int a0 = blockIdx.x * MMA + threadIdx.y * 4;
+    const int b0 = blockIdx.y * MMB + threadIdx.x * 4;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * 16 + tx;
+    const size_t plane = (size_t)outer * inner;
+
+    __shared__ float sx[MODE0 ? MMK * (MMB + 1) : MMB * (MMK + 1)];
+    __shared__ float sw[MMA * (MMK + 1)];
+
+    float acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = (bias && a0 + i < A) ? bias[a0 + i] : 0.0f;
+    }
+
+    for (int k0 = 0; k0 < K; k0 += MMK) {
+        // Fill both tiles. One float4 per thread, which is exactly the 256 a 64x16
+        // patch needs: no per-thread loop, and every warp reads either 128
+        // consecutive bytes (a whole row of a K-contiguous tile) or two rows of 64
+        // (the transposed one) - never a stride long enough to split a transaction.
+        //
+        // An element outside the matrix is written as ZERO, not skipped: with K
+        // chunked, a skipped slot would be read back holding the previous chunk's
+        // value. The guard is therefore on the value, not the store.
+        {
+            const int n = tid;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (MODE0) {
+                // 16 K rows of 16 float4s each, one float4 per thread: row =
+                // n / 16, column = n % 16. (Dividing by the ROW LENGTH in floats
+                // - MMB - instead would give only 4 distinct rows and read the
+                // same 4 rows of every chunk: the first version of this did, and
+                // it is the sort of error that looks like a bad transpose.)
+                const int k = k0 + n / (MMB / 4);
+                const int b = (n % (MMB / 4)) * 4;
+                // The tile column, NOT `b0 + b`: the fill enumerates all 64
+                // columns of the tile, while `b0` is only this thread's own
+                // output column.
+                const int r = blockIdx.y * MMB + b;
+                if (k < K && r + 3 < B && (r % inner) + 3 < inner) {
+                    v = *reinterpret_cast<const float4 *>(
+                        in + (size_t)(r / inner) * plane + (size_t)k * inner + (r % inner));
+                } else if (k < K && r < B && (r % inner) + 3 >= inner) {
+                    // A channel boundary falls inside this float4, so the four
+                    // columns are not contiguous. Unreachable in this model
+                    // (`inner` is always a multiple of 64 and `r` is a multiple
+                    // of 4), but the alternative is zeroing columns that are
+                    // inside the matrix.
+                    const size_t base = (size_t)(r / inner) * plane + (size_t)k * inner + (r % inner);
+                    if ((r % inner) + 0 < inner) v.x = in[base + 0];
+                    if ((r % inner) + 1 < inner) v.y = in[base + 1];
+                    if ((r % inner) + 2 < inner) v.z = in[base + 2];
+                }
+                // The tile row is the K index WITHIN this chunk, `n / 16`, not
+                // `n / MMB`: the latter is the float index divided by the row
+                // length in floats and lands every thread in rows 0..3.
+                sx[mm_sx<MODE0>(b + 0, n / (MMB / 4))] = v.x;
+                sx[mm_sx<MODE0>(b + 1, n / (MMB / 4))] = v.y;
+                sx[mm_sx<MODE0>(b + 2, n / (MMB / 4))] = v.z;
+                sx[mm_sx<MODE0>(b + 3, n / (MMB / 4))] = v.w;
+            } else {
+                // 64 B rows of 16 K values; here the row index is B.
+                const int b = n / (MMK / 4);
+                const int k = (n % (MMK / 4)) * 4;
+                const int r = blockIdx.y * MMB + b;
+                if (r < B && k0 + k + 3 < K) {
+                    v = *reinterpret_cast<const float4 *>(
+                        in + (size_t)(r / outer) * plane + (size_t)(r % outer) * inner + k0 + k);
+                }
+                sx[mm_sx<MODE0>(b, k + 0)] = v.x;
+                sx[mm_sx<MODE0>(b, k + 1)] = v.y;
+                sx[mm_sx<MODE0>(b, k + 2)] = v.z;
+                sx[mm_sx<MODE0>(b, k + 3)] = v.w;
+            }
+        }
+        // The weight tile, [A][K] with K contiguous.
+        {
+            const int n = tid;
+            const int a = n / (MMK / 4);
+            const int k = (n % (MMK / 4)) * 4;
+            const int ar = blockIdx.x * MMA + a;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (ar < A && k0 + k + 3 < K) {
+                v = *reinterpret_cast<const float4 *>(w + (size_t)ar * K + k0 + k);
+            } else if (ar < A) {
+                // A K tail shorter than 4: the weight is the only operand whose
+                // rows are contiguous in K, so the partial read has to be
+                // elementwise.
+                if (k0 + k + 0 < K) v.x = w[(size_t)ar * K + k0 + k + 0];
+                if (k0 + k + 1 < K) v.y = w[(size_t)ar * K + k0 + k + 1];
+                if (k0 + k + 2 < K) v.z = w[(size_t)ar * K + k0 + k + 2];
+            }
+            sw[a * (MMK + 1) + k + 0] = v.x;
+            sw[a * (MMK + 1) + k + 1] = v.y;
+            sw[a * (MMK + 1) + k + 2] = v.z;
+            sw[a * (MMK + 1) + k + 3] = v.w;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < MMK; ++k) {
+            float xv[4];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) xv[j] = sx[mm_sx<MODE0>(tx * 4 + j, k)];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float wv = sw[(ty * 4 + i) * (MMK + 1) + k];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] += wv * xv[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int a = a0 + i, b = b0 + j;
+            if (a < A && b < B) {
+                const int ch = MODE0 ? b / inner : b / outer;
+                const int bl = MODE0 ? b % inner : b % outer;
+                out[(size_t)ch * plane + (MODE0 ? (size_t)a * inner + bl : (size_t)bl * inner + a)] =
+                    acc[i][j];
+            }
+        }
+    }
+}
+
+// mode 0: the Dense reduces over the activation's `outer` axis.
+extern "C" __global__ void mx_gate_mm_t0(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c, int outer, int inner)
+{
+    mm_body<1>(in, w, bias, out, c, outer, inner);
+}
+
+// mode 1: it reduces over `inner`, the contiguous axis.
+extern "C" __global__ void mx_gate_mm_t1(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c, int outer, int inner)
+{
+    mm_body<0>(in, w, bias, out, c, outer, inner);
 }
 
 // elementwise multiply: y = a * b. The CALayer's `x * sigmoid(y)` and the

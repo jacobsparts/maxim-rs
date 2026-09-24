@@ -62,6 +62,10 @@ pub struct Gpu {
     /// run is not the run being reported.
     timeline: Option<Timeline>,
     want_timeline: bool,
+    /// Force the pre-tiling kernels, for an A/B measurement: `--legacy-ops` or
+    /// `MAXIM_LEGACY_OPS=1`. Both spellings of every tiled kernel are in the
+    /// binary, so this is a runtime switch rather than a rebuild.
+    legacy_ops: bool,
 }
 
 /// Where the device time went, per op.
@@ -82,6 +86,7 @@ impl Gpu {
             kernels: 0,
             timeline: None,
             want_timeline: std::env::var_os("MAXIM_TIMELINE").is_some(),
+            legacy_ops: std::env::var_os("MAXIM_LEGACY_OPS").is_some(),
         })
     }
 
@@ -109,6 +114,13 @@ impl Gpu {
     /// does the same thing, so `--timeline` is only the discoverable spelling.
     pub fn set_timeline(&mut self, on: bool) {
         self.want_timeline = on;
+    }
+
+    /// Use the kernels as they were before the tiling work. The tiled and the
+    /// original forms of every op are both in the binary, so this is how the
+    /// speedup is measured rather than asserted.
+    pub fn set_legacy_ops(&mut self, on: bool) {
+        self.legacy_ops = on;
     }
 
     /// Run the plan. The arena is zeroed first so an op that reads a buffer the
@@ -294,25 +306,46 @@ impl Gpu {
                 args.ptr(x).ptr(sp).ptr(d).i32(c as i32).i32(hw as i32);
                 self.go("mx_channel_scale", Cuda::grid_for(c * hw, BLOCK), (BLOCK, 1, 1), plan, &mut args)?;
             }
-            Op::Conv1x1 { dst, src, w: _, wt, bias, c_in, c_out, h, wd } => {
+            Op::Conv1x1 { dst, src, w, wt, bias, c_in, c_out, h, wd } => {
                 // `mx_conv1x1_t`, not the toolkit's `lg_conv1x1`: this op family
                 // holds a third of the run and the toolkit's one-output-per-thread
                 // form re-reads the input column per output. The tiled kernel
                 // needs the transposed weight, which the plan carries as `wt` -
                 // the two blobs are the same numbers in the two layouts the two
                 // kernels want.
-                let wt = wt.expect("the plan was built for the CPU: use --device cpu");
-                let wp = self.wp(host, wt)?;
                 let bp = match bias {
                     Some(b) => self.wp(host, b)?,
                     None => 0,
                 };
                 let (d, s) = (self.dp(plan, dst), self.dp(plan, src));
-                let mut args = Args::new();
-                args.ptr(s).ptr(wp).ptr(bp).ptr(d).i32(c_in as i32).i32(c_out as i32).i32(h as i32).i32(wd as i32);
-                let plane = (h * wd).max(1) as u32;
-                let octiles = c_out.div_ceil(4).max(1) as u32;
-                self.go("mx_conv1x1_t", (Cuda::grid_for(plane as usize, BLOCK).0, octiles, 1), (BLOCK, 1, 1), plan, &mut args)?;
+                if self.legacy_ops {
+                    let wp = self.wp(host, w)?;
+                    let mut args = Args::new();
+                    args.ptr(s).ptr(wp).ptr(bp).ptr(d)
+                        .i32(c_in as i32).i32(c_out as i32).i32(h as i32).i32(wd as i32);
+                    self.go(
+                        "lg_conv1x1",
+                        Cuda::grid_for(c_out * h * wd, BLOCK),
+                        (BLOCK, 1, 1),
+                        plan,
+                        &mut args,
+                    )?;
+                } else {
+                    let wt = wt.expect("the plan was built for the CPU: use --device cpu");
+                    let wp = self.wp(host, wt)?;
+                    let mut args = Args::new();
+                    args.ptr(s).ptr(wp).ptr(bp).ptr(d)
+                        .i32(c_in as i32).i32(c_out as i32).i32(h as i32).i32(wd as i32);
+                    let plane = (h * wd).max(1) as u32;
+                    let octiles = c_out.div_ceil(4).max(1) as u32;
+                    self.go(
+                        "mx_conv1x1_t",
+                        (Cuda::grid_for(plane as usize, BLOCK).0, octiles, 1),
+                        (BLOCK, 1, 1),
+                        plan,
+                        &mut args,
+                    )?;
+                }
             }
             Op::Conv3x3 { dst, src, w, bias, c_in, c_out, h, wd } => {
                 let wp = self.wp(host, w)?;
@@ -323,7 +356,39 @@ impl Gpu {
                 let (d, s) = (self.dp(plan, dst), self.dp(plan, src));
                 let mut args = Args::new();
                 args.ptr(s).ptr(wp).ptr(bp).ptr(d).i32(c_in as i32).i32(c_out as i32).i32(h as i32).i32(wd as i32);
-                self.go("lg_conv3x3s1p1", Cuda::grid_for(c_out * h * wd, BLOCK), (BLOCK, 1, 1), plan, &mut args)?;
+                // The tiled form wants a 64-pixel-wide row segment; every feature
+                // map this engine builds satisfies that (the plan pads to a
+                // multiple of 64 and each level halves), but the guard means a
+                // caller with an odd width gets the toolkit kernel rather than a
+                // silently wrong answer. It also picks the narrow variant for
+                // c_out < 64, which keeps a 32-channel layer from running with
+                // half the block idle.
+                let tiles = if self.legacy_ops || wd % 64 != 0 {
+                    None
+                } else if c_out >= 64 {
+                    Some(("mx_conv3x3_t4", 16u32, 16u32, 64usize))
+                } else {
+                    Some(("mx_conv3x3_t2", 32, 8, 32usize))
+                };
+                match tiles {
+                    Some((name, bx, by, loc)) => {
+                        let grid = (
+                            c_out.div_ceil(loc).max(1) as u32,
+                            (h * (wd / 64)).max(1) as u32,
+                            1,
+                        );
+                        self.go(name, grid, (bx, by, 1), plan, &mut args)?;
+                    }
+                    None => {
+                        self.go(
+                            "lg_conv3x3s1p1",
+                            Cuda::grid_for(c_out * h * wd, BLOCK),
+                            (BLOCK, 1, 1),
+                            plan,
+                            &mut args,
+                        )?;
+                    }
+                }
             }
             Op::Conv4x4s2 { dst, src, w, bias, c_in, c_out, h, wd, pad_top, pad_left, oh, ow } => {
                 let wp = self.wp(host, w)?;
@@ -358,8 +423,37 @@ impl Gpu {
                 let (d, s) = (self.dp(plan, dst), self.dp(plan, src));
                 let mut args = Args::new();
                 args.ptr(s).ptr(wp).ptr(bp).ptr(d)
-                    .i32(c as i32).i32(outer as i32).i32(inner as i32).i32(mode as i32);
-                self.go("mx_gate_mm", Cuda::grid_for(c * outer * inner, BLOCK), (BLOCK, 1, 1), plan, &mut args)?;
+                    .i32(c as i32).i32(outer as i32).i32(inner as i32);
+                // The tiled implicit GEMM, one entry point per mode because the
+                // mode decides which axis of the activation is the contiguous one
+                // and that has to be a compile-time choice inside the kernel.
+                // The alternative - `mx_gate_mm`, one thread per output element -
+                // is still linked and still what `--legacy-ops` uses.
+                if self.legacy_ops {
+                    let mut args = Args::new();
+                    args.ptr(s).ptr(wp).ptr(bp).ptr(d)
+                        .i32(c as i32).i32(outer as i32).i32(inner as i32).i32(mode as i32);
+                    self.go(
+                        "mx_gate_mm",
+                        Cuda::grid_for(c * outer * inner, BLOCK),
+                        (BLOCK, 1, 1),
+                        plan,
+                        &mut args,
+                    )?;
+                } else {
+                    // A is the axis the Dense replaces, K the axis it reduces.
+                    // They are equal for this model's gating Dense, but the grid
+                    // is built from A and the kernel is told both.
+                    let a = if mode == 0 { outer } else { inner };
+                    let b = if mode == 0 { c * inner } else { c * outer };
+                    let grid = (
+                        a.div_ceil(64).max(1) as u32,
+                        b.div_ceil(64).max(1) as u32,
+                        1,
+                    );
+                    let name = if mode == 0 { "mx_gate_mm_t0" } else { "mx_gate_mm_t1" };
+                    self.go(name, grid, (16, 16, 1), plan, &mut args)?;
+                }
             }
             Op::BlockPerm { dst, src, c, h, wd, gh, gw, fh, fw, swap, forward } => {
                 let (d, s) = (self.dp(plan, dst), self.dp(plan, src));

@@ -36,6 +36,8 @@ OPTIONS
       --profile         report the plan's size, op count and where the GPU time
                         went, per op and per op kind (MAXIM_TIMELINE=1 does the
                         same thing)
+      --legacy-ops      use the kernels as they were before the tiling work, so
+                        the speedup can be measured (MAXIM_LEGACY_OPS=1 too)
       --verify-gpu      run the plan ONE OP AT A TIME on the CPU and the GPU,
                         comparing each op's destination between them; reports the
                         first op where they disagree. `--device` is ignored.
@@ -57,6 +59,7 @@ fn main() {
     let mut dump: Option<String> = None;
     let mut profile = false;
     let mut verify_gpu = false;
+    let mut legacy_ops = std::env::var_os("MAXIM_LEGACY_OPS").is_some();
 
     let mut i = 1;
     while i < args.len() {
@@ -75,6 +78,9 @@ fn main() {
             "--factor" => factor = next(&mut i).parse().unwrap_or(64),
             "--dump" => dump = Some(next(&mut i)),
             "--profile" | "--timeline" => profile = true,
+            // The pre-tiling kernels are still in the binary, so the speedup is a
+            // measurement rather than a claim.
+            "--legacy-ops" => legacy_ops = true,
             "--verify-gpu" => verify_gpu = true,
             "-h" | "--help" => usage(),
             other => {
@@ -85,7 +91,7 @@ fn main() {
         i += 1;
     }
 
-    if let Err(e) = run(input, output, model, &task, variant, &device, factor, dump, profile, verify_gpu) {
+    if let Err(e) = run(input, output, model, &task, variant, &device, factor, dump, profile, verify_gpu, legacy_ops) {
         eprintln!("maxim: {e}");
         std::process::exit(1)
     }
@@ -103,6 +109,7 @@ fn run(
     dump: Option<String>,
     profile: bool,
     verify_gpu: bool,
+    legacy_ops: bool,
 ) -> Result<(), maxim::Error> {
     let (Some(input), Some(model)) = (input, model) else {
         usage()
@@ -167,6 +174,7 @@ fn run(
         "gpu" => {
             let mut gpu = maxim::exec_gpu::Gpu::new(&host.plan)?;
             gpu.set_timeline(profile);
+            gpu.set_legacy_ops(legacy_ops);
             let mut out = vec![0.0f32; host.plan.bufs[host.plan.output].len()];
             let o = host.plan.offs[host.plan.input];
             let n = host.plan.bufs[host.plan.input].len();

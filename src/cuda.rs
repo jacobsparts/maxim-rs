@@ -27,9 +27,13 @@ pub const TOOLKIT_FATBIN: &[u8] = include_bytes!(env!("LIGHTGPU_FATBIN_MAXIM_TOO
 /// The names in each module, for the startup completeness check.
 pub const PROJECT_KERNELS: &[&str] = &[
     "mx_conv1x1_t",
+    "mx_conv3x3_t2",
+    "mx_conv3x3_t4",
     "mx_conv4x4s2",
     "mx_convt2x2s2",
     "mx_gate_mm",
+    "mx_gate_mm_t0",
+    "mx_gate_mm_t1",
     "mx_mul",
     "mx_gate_apply",
     "mx_resize_axis",
