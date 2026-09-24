@@ -33,10 +33,12 @@ OPTIONS
       --factor <n>      pad the input to a multiple of n (default 64, as the
                         reference eval script does)
       --dump <dir>      write every named activation as .npy for the parity tool
-      --profile         report the plan's size, op count and per-op time
-  --verify-gpu      run the plan ONE OP AT A TIME on the CPU and the GPU,
-                    comparing each op's destination between them; reports the
-                    first op where they disagree. `--device` is ignored.
+      --profile         report the plan's size, op count and where the GPU time
+                        went, per op and per op kind (MAXIM_TIMELINE=1 does the
+                        same thing)
+      --verify-gpu      run the plan ONE OP AT A TIME on the CPU and the GPU,
+                        comparing each op's destination between them; reports the
+                        first op where they disagree. `--device` is ignored.
   -h, --help            this text
 "
     );
@@ -72,7 +74,7 @@ fn main() {
             "--device" => device = next(&mut i),
             "--factor" => factor = next(&mut i).parse().unwrap_or(64),
             "--dump" => dump = Some(next(&mut i)),
-            "--profile" => profile = true,
+            "--profile" | "--timeline" => profile = true,
             "--verify-gpu" => verify_gpu = true,
             "-h" | "--help" => usage(),
             other => {
@@ -164,18 +166,12 @@ fn run(
         #[cfg(feature = "cuda")]
         "gpu" => {
             let mut gpu = maxim::exec_gpu::Gpu::new(&host.plan)?;
+            gpu.set_timeline(profile);
             let mut out = vec![0.0f32; host.plan.bufs[host.plan.output].len()];
             let o = host.plan.offs[host.plan.input];
             let n = host.plan.bufs[host.plan.input].len();
             let img = host.arena[o..o + n].to_vec();
             gpu.run(&host.plan, &host.weights, &img, &mut out)?;
-            // The whole arena comes back, not just the output: the dump step and
-            // the output crop both read it out of `host.arena`, and a named
-            // activation is only meaningful if the buffer it lives in was
-            // written by THIS run.
-            let mut arena = vec![0.0f32; host.plan.arena_len];
-            gpu.read_arena(&mut arena)?;
-            host.arena = arena;
             println!(
                 "gpu: {} launches, arena {:.1} MiB, weights {:.1} MiB, pool {:.1} KiB",
                 gpu.ops_launched(),
@@ -183,6 +179,21 @@ fn run(
                 gpu.weight_bytes() as f64 / 1048576.0,
                 gpu.pool_bytes() as f64 / 1024.0
             );
+            if let Some(tl) = gpu.timeline() {
+                report_timeline(&host.plan, tl);
+            }
+            // Nothing downstream reads the arena unless it is being dumped or
+            // cropped, and on a profiled run the copy is the largest thing in
+            // the measurement - 942 MiB back over PCIe is ~0.4 s of the total.
+            if dump.is_some() || output.is_some() {
+                // The whole arena comes back, not just the output: the dump step
+                // and the output crop both read it out of `host.arena`, and a
+                // named activation is only meaningful if the buffer it lives in
+                // was written by THIS run.
+                let mut arena = vec![0.0f32; host.plan.arena_len];
+                gpu.read_arena(&mut arena)?;
+                host.arena = arena;
+            }
         }
         #[cfg(not(feature = "cuda"))]
         "gpu" => return Err("this binary was built without the `cuda` feature; use --device cpu".into()),
@@ -221,6 +232,57 @@ fn run(
         println!("ops: {}", host.plan.ops.len());
     }
     Ok(())
+}
+
+/// Where the GPU time went, grouped by op kind.
+///
+///
+/// The per-op numbers come from a CUDA event around each op, so they are device
+/// time and they sum to the run. What matters is the SHARE: the graph is 1840
+/// ops, and one kernel family holding a third of the time is a different problem
+/// from every op costing the same, which is what the total alone cannot say.
+#[cfg(feature = "cuda")]
+fn report_timeline(plan: &maxim::model::Plan, tl: &maxim::exec_gpu::Timeline) {
+    use std::collections::HashMap;
+    let mut by_kind: HashMap<String, (f32, usize, usize)> = HashMap::new();
+    for (i, op) in plan.ops.iter().enumerate() {
+        // `describe` splits on the first space, and its first word is the op's
+        // family: conv1x1, chanln, blockperm, ... This is a report, not a hot
+        // loop, so the per-op format! is affordable and the grouping stays in
+        // step with the description the rest of the tooling prints.
+        let d = maxim::exec_cpu::describe(op);
+        let kind = d.split_whitespace().next().unwrap_or("?").to_string();
+        let e = by_kind.entry(kind).or_insert((0.0, 0, 0));
+        e.0 += tl.per_op_ms[i];
+        e.1 += 1;
+        e.2 += tl.kernels_per_op[i];
+    }
+    let mut rows: Vec<_> = by_kind.into_iter().collect();
+    rows.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    println!(
+        "timeline: {:.2}s total, {} ops, {} launches",
+        tl.total_ms / 1000.0,
+        tl.per_op_ms.len(),
+        tl.kernels_per_op.iter().sum::<usize>()
+    );
+    println!("{:<10} {:>7} {:>9} {:>10} {:>7}  {}", "op", "count", "total ms", "ms/op", "kernels", "share");
+    for (kind, (ms, count, kernels)) in rows {
+        println!(
+            "{:<10} {:>7} {:>9.1} {:>10.3} {:>7}  {:>5.1}%",
+            kind,
+            count,
+            ms,
+            ms / count as f32,
+            kernels,
+            100.0 * ms / tl.total_ms.max(1e-6)
+        );
+    }
+    let mut worst: Vec<(usize, f32)> = tl.per_op_ms.iter().copied().enumerate().collect();
+    worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    println!("slowest ops:");
+    for (i, ms) in worst.into_iter().take(5) {
+        println!("  op {i} {:.2} ms  {}", ms, maxim::exec_cpu::describe(&plan.ops[i]));
+    }
 }
 
 /// Run the plan one op at a time on both backends and report the first op whose

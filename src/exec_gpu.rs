@@ -12,7 +12,7 @@
 //!   width.
 
 use lightgpu::ffi::CUdeviceptr;
-use lightgpu::vm::{copy_d2d, copy_dtoh, Args};
+use lightgpu::vm::{copy_d2d, copy_dtoh, Args, Event};
 
 use crate::cuda::{Buf, Cuda, WeightCache};
 use crate::model::{Op, Plan};
@@ -53,6 +53,22 @@ pub struct Gpu {
     /// `bytes` and `out` are the only host round trips in the whole graph: the
     /// input image in, and the output image out.
     launched: usize,
+    /// Launches, which is not the same number: one op is usually one kernel, but
+    /// `Op::Resize` is two passes and `Op::Copy` is a memcpy rather than a
+    /// launch. Only meaningful with `--timeline`.
+    kernels: usize,
+    /// Per-op device time, sampled with CUDA events around each op. Off by
+    /// default: recording an event per op is cheap but not free, and a profiled
+    /// run is not the run being reported.
+    timeline: Option<Timeline>,
+    want_timeline: bool,
+}
+
+/// Where the device time went, per op.
+pub struct Timeline {
+    pub per_op_ms: Vec<f32>,
+    pub kernels_per_op: Vec<usize>,
+    pub total_ms: f32,
 }
 
 impl Gpu {
@@ -63,6 +79,9 @@ impl Gpu {
             pool: SmallPool::new(),
             weights: WeightCache::new(plan.weights.len()),
             launched: 0,
+            kernels: 0,
+            timeline: None,
+            want_timeline: std::env::var_os("MAXIM_TIMELINE").is_some(),
         })
     }
 
@@ -82,14 +101,64 @@ impl Gpu {
         self.launched
     }
 
+    pub fn timeline(&self) -> Option<&Timeline> {
+        self.timeline.as_ref()
+    }
+
+    /// Turn the per-op timeline on (or off). `MAXIM_TIMELINE` in the environment
+    /// does the same thing, so `--timeline` is only the discoverable spelling.
+    pub fn set_timeline(&mut self, on: bool) {
+        self.want_timeline = on;
+    }
+
     /// Run the plan. The arena is zeroed first so an op that reads a buffer the
     /// plan never wrote is a visible NaN/zero rather than stale memory.
     pub fn run(&mut self, plan: &Plan, host: &[Vec<f32>], input: &[f32], output: &mut [f32]) -> Result<(), Error> {
         self.begin(plan, input)?;
-        for op in &plan.ops {
-            self.op(plan, host, op)?;
+        if self.want_timeline {
+            self.run_timed(plan, host)?;
+        } else {
+            for op in &plan.ops {
+                self.op(plan, host, op)?;
+            }
         }
         self.read_at(plan.offs[plan.output], output)?;
+        Ok(())
+    }
+
+    /// The same loop with a CUDA event before every op and one after the last,
+    /// so per-op device time is measured rather than inferred from the total.
+    ///
+    /// Nothing here waits per op: all `n + 1` events are recorded into the queue
+    /// and the loop synchronises ONCE, at the end. The alternative - resolve each
+    /// op before launching the next - measures a serialised version of the queue
+    /// and inflates a 8.4 s run to 17 s, which would make the profile a different
+    /// program from the one being profiled. Between two events the device runs
+    /// exactly one op, so the deltas are the ops' own times and they sum to the
+    /// device's total.
+    fn run_timed(&mut self, plan: &Plan, host: &[Vec<f32>]) -> Result<(), Error> {
+        let n = plan.ops.len();
+        let mut ev = Vec::with_capacity(n + 1);
+        for _ in 0..=n {
+            ev.push(Event::new().map_err(Error)?);
+        }
+        let mut kernels_per_op = Vec::with_capacity(n);
+        for (i, op) in plan.ops.iter().enumerate() {
+            let before = self.kernels;
+            ev[i].record().map_err(Error)?;
+            self.op(plan, host, op)?;
+            kernels_per_op.push(self.kernels - before);
+        }
+        ev[n].record().map_err(Error)?;
+        lightgpu::vm::sync().map_err(Error)?;
+        let mut per_op_ms = Vec::with_capacity(n);
+        let mut total = 0.0f32;
+        for i in 0..n {
+            let ms = ev[i].elapsed_ms(&ev[i + 1]).map_err(Error)?;
+            total += ms;
+            per_op_ms.push(ms);
+        }
+        self.timeline = Some(Timeline { per_op_ms, kernels_per_op, total_ms: total });
         Ok(())
     }
 
@@ -225,8 +294,15 @@ impl Gpu {
                 args.ptr(x).ptr(sp).ptr(d).i32(c as i32).i32(hw as i32);
                 self.go("mx_channel_scale", Cuda::grid_for(c * hw, BLOCK), (BLOCK, 1, 1), plan, &mut args)?;
             }
-            Op::Conv1x1 { dst, src, w, bias, c_in, c_out, h, wd } => {
-                let wp = self.wp(host, w)?;
+            Op::Conv1x1 { dst, src, w: _, wt, bias, c_in, c_out, h, wd } => {
+                // `mx_conv1x1_t`, not the toolkit's `lg_conv1x1`: this op family
+                // holds a third of the run and the toolkit's one-output-per-thread
+                // form re-reads the input column per output. The tiled kernel
+                // needs the transposed weight, which the plan carries as `wt` -
+                // the two blobs are the same numbers in the two layouts the two
+                // kernels want.
+                let wt = wt.expect("the plan was built for the CPU: use --device cpu");
+                let wp = self.wp(host, wt)?;
                 let bp = match bias {
                     Some(b) => self.wp(host, b)?,
                     None => 0,
@@ -234,7 +310,9 @@ impl Gpu {
                 let (d, s) = (self.dp(plan, dst), self.dp(plan, src));
                 let mut args = Args::new();
                 args.ptr(s).ptr(wp).ptr(bp).ptr(d).i32(c_in as i32).i32(c_out as i32).i32(h as i32).i32(wd as i32);
-                self.go("lg_conv1x1", Cuda::grid_for(c_out * h * wd, BLOCK), (BLOCK, 1, 1), plan, &mut args)?;
+                let plane = (h * wd).max(1) as u32;
+                let octiles = c_out.div_ceil(4).max(1) as u32;
+                self.go("mx_conv1x1_t", (Cuda::grid_for(plane as usize, BLOCK).0, octiles, 1), (BLOCK, 1, 1), plan, &mut args)?;
             }
             Op::Conv3x3 { dst, src, w, bias, c_in, c_out, h, wd } => {
                 let wp = self.wp(host, w)?;
@@ -319,7 +397,8 @@ impl Gpu {
         Ok(())
     }
 
-    fn go(&self, kernel: &str, grid: (u32, u32, u32), block: (u32, u32, u32), _plan: &Plan, args: &mut Args) -> Result<(), Error> {
+    fn go(&mut self, kernel: &str, grid: (u32, u32, u32), block: (u32, u32, u32), _plan: &Plan, args: &mut Args) -> Result<(), Error> {
+        self.kernels += 1;
         self.cuda.launch(kernel, grid, block, args)
     }
 }

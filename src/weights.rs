@@ -66,6 +66,33 @@ impl Weights {
         }
     }
 
+    /// The same weight TRANSPOSED to `[c_in][c_out]`, for this engine's
+    /// `mx_conv1x1_t`.
+    ///
+    /// The toolkit's `lg_conv1x1` reads the `[c_out][c_in]` form because it gives
+    /// one thread a single output channel, so its inner loop walks `c_in`
+    /// contiguously. That kernel moves about `c_in` times the traffic the op
+    /// needs (see `mx_conv1x1_t`), and the fix - several output channels per
+    /// thread - makes the weight the *strided* operand unless it is transposed
+    /// first. Two layouts, both defensible, chosen by which kernel reads them;
+    /// the CPU executor keeps using the `[c_out][c_in]` one, so both blobs are
+    /// built for a GPU run and only the first for a CPU one.
+    pub fn conv1x1_t(&self, name: &str) -> Result<Vec<f32>, Error> {
+        let k = self.vec(name)?;
+        let s = self.shape(name)?;
+        match s.len() {
+            // Dense: already [c_in][c_out].
+            2 => {}
+            4 if s[0] == 1 && s[1] == 1 => {}
+            _ => return Err(format!("{name}: expected a 1x1 or Dense kernel, got {s:?}").into()),
+        }
+        // No permutation: flax stores both the Dense and the 1x1 conv as
+        // `[..., c_in, c_out]`, which is exactly the transposed layout the tiled
+        // kernel indexes. The `[c_out][c_in]` form the toolkit reads is the one
+        // that has to be built, not this one.
+        Ok(k.to_vec())
+    }
+
     /// A k x k conv weight as `[c_out][c_in][k][k]`, the layout
     /// `lg_conv3x3s1p1` reads: it steps `c_in` with stride `k*k` inside a tap.
     pub fn convkxk(&self, name: &str) -> Result<Vec<f32>, Error> {

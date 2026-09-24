@@ -9,6 +9,62 @@
 // Everything here is NCHW, except `mx_gate_mm` and `mx_block_perm`, which work on
 // the *blocked* layout MAXIM's gMLP layers are written in.
 
+// 1x1 conv over a TRANSPOSED weight, `[c_in][c_out]` - this engine's own
+// replacement for the toolkit's `lg_conv1x1`, which the model still links.
+//
+// The profile made the reason concrete: at 512x512 the gMLP's 1x1 convs hold 30%
+// of the run, and `lg_conv1x1` was moving about 26x the traffic the op needs. It
+// puts one thread on each output element, so a thread walks its input column one
+// `plane`-strided float at a time and the block touches a 32-byte sector per tap
+// to use 4 of its 8 floats - and because the weight is `[c_out][c_in]`, the
+// alternative of giving each thread several output channels would stride c_in
+// through the weight on every step. Both halves of that are fixed here: a
+// transposed weight makes consecutive outputs consecutive, and the input column
+// is then shared by TILE outputs instead of re-read by each.
+//
+// `wd` is the contiguous axis, so consecutive threads read consecutive inputs
+// (coalesced) and the load is issued once outside the output loop, which the
+// compiler hoists and keeps in registers under TILE=4.
+extern "C" __global__ void mx_conv1x1_t(
+    const float *__restrict__ in, const float *__restrict__ w,
+    const float *__restrict__ bias, float *__restrict__ out,
+    int c_in, int c_out, int h, int wd)
+{
+    // Not a hard requirement: the c_out remainder is handled per thread below.
+    // It only has to divide the fixed-width array, which it does on any driver
+    // this builds for.
+    constexpr int TILE = 4;
+    const size_t plane = (size_t)h * wd;
+    const long p = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= (long)plane) return;
+    int oc0 = blockIdx.y * TILE;
+
+    float acc[TILE];
+    #pragma unroll
+    for (int j = 0; j < TILE; ++j) {
+        const int oc = oc0 + j;
+        acc[j] = (oc < c_out && bias) ? bias[oc] : 0.0f;
+    }
+    for (int ic = 0; ic < c_in; ++ic) {
+        const float v = in[(size_t)ic * plane + (size_t)p];
+        const float *wp = w + (size_t)ic * c_out + oc0;
+        #pragma unroll
+        for (int j = 0; j < TILE; ++j) {
+            // Deviates from the toolkit's (oc, ic) accumulation order, where
+            // that kernel's inner `if (wv == 0.0f) continue` makes the order
+            // data-dependent anyway. Recorded rather than chased: both are f32
+            // sums of the same products and the op-by-op check bounds the
+            // difference against the buffer, not against exact equality.
+            if (oc0 + j < c_out) acc[j] += wp[j] * v;
+        }
+    }
+    #pragma unroll
+    for (int j = 0; j < TILE; ++j) {
+        const int oc = oc0 + j;
+        if (oc < c_out) out[(long)oc * (long)plane + p] = acc[j];
+    }
+}
+
 // 4x4 stride 2 with flax's padding='SAME' - `Conv_down`, the UNet encoder's
 // downsample.
 //

@@ -83,7 +83,12 @@ pub enum Op {
     ChanMean { dst: usize, src: usize, c: usize, hw: usize },
     /// `out[c][p] = in[c][p] * s[c]`: the CALayer's excitation.
     ChanScale { dst: usize, src: usize, s: usize, c: usize, hw: usize },
-    Conv1x1 { dst: usize, src: usize, w: usize, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
+    /// `wt` is THE SAME WEIGHT as `w`, transposed to `[c_in][c_out]`. It exists
+    /// only for the GPU, whose tiled kernel needs the transposed layout (see
+    /// `mx_conv1x1_t`); the CPU executor reads `w` and ignores this, and a plan
+    /// built for the CPU does not add the blob at all. Both indices are operands
+    /// in the plan-weight sense, never arena buffers - see `Op::operands`.
+    Conv1x1 { dst: usize, src: usize, w: usize, wt: Option<usize>, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
     Conv3x3 { dst: usize, src: usize, w: usize, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
     Conv4x4s2 { dst: usize, src: usize, w: usize, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize, pad_top: usize, pad_left: usize, oh: usize, ow: usize },
     ConvT2x2 { dst: usize, src: usize, w: usize, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
@@ -284,12 +289,20 @@ impl<'a> Builder<'a> {
     fn conv1x1(&mut self, dst: usize, src: usize, prefix: &str, c_in: usize, c_out: usize, h: usize, wd: usize) -> Result<(), Error> {
         let k = self.w.conv1x1(&format!("{prefix}/kernel"))?;
         let w = self.weight(k);
+        // The transposed twin the GPU's tiled kernel reads. Built for the GPU
+        // build only: it is the second copy of a weight the CPU path never looks
+        // at, and a CPU run should not pay the transpose.
+        let wt = if cfg!(feature = "cuda") {
+            Some(self.weight(self.w.conv1x1_t(&format!("{prefix}/kernel"))?))
+        } else {
+            None
+        };
         let bias = if self.w.has(&format!("{prefix}/bias")) {
             Some(self.own(&format!("{prefix}/bias"))?)
         } else {
             None
         };
-        self.ops.push(Op::Conv1x1 { dst, src, w, bias, c_in, c_out, h, wd });
+        self.ops.push(Op::Conv1x1 { dst, src, w, wt, bias, c_in, c_out, h, wd });
         Ok(())
     }
 

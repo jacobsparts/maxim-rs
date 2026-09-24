@@ -254,7 +254,10 @@ impl<'a> Ctx<'a> {
                     d[i] = x[i] * sc[i / hw];
                 }
             }
-            Op::Conv1x1 { dst, src, w, bias, c_in, c_out, h, wd } => {
+            // `wt` is the GPU's transposed twin of `w`; this executor reads the
+            // original because its `ic`-outer, plane-contiguous loop wants the
+            // `[c_out][c_in]` layout, and a CPU-only plan does not build it.
+            Op::Conv1x1 { dst, src, w, bias, c_in, c_out, h, wd, .. } => {
                 let (d, s) = io2(arena, o(dst), c_out * h * wd, o(src), c_in * h * wd);
                 let wt = &weights[w];
                 let bs = bias.map(|b| &weights[b]);

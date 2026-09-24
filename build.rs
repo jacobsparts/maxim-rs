@@ -21,7 +21,13 @@ const TOOLKIT_KERNELS: &[&str] = &[
     // different and are the same op: an NCHW (c, h*w) tensor, and a gMLP tensor
     // in the blocked layout (c, grid*patch) whose channel axis is contiguous.
     "lg_channel_layer_norm",
-    // 1x1 conv, used for every Dense/Conv1x1 in the model.
+    // 1x1 conv. NO LONGER LAUNCHED: it is the model's biggest op family, and its
+    // one-thread-per-output form re-reads the input `c_in` times (see
+    // `mx_conv1x1_t`). It stays in the list because leaving a kernel out of
+    // `--entries` prunes it from the fatbin and a stale caller would then fail at
+    // LAUNCH - the compile-time completeness check at the bottom of this file is
+    // what keeps the two in step, and it cannot tell a call site from a
+    // declaration.
     "lg_conv1x1",
     // 3x3 pad-1 conv, the SAM block and the stage input convs. The Winograd
     // variant is *not* used: at c_in=3 the transform does not amortise, and the
@@ -31,6 +37,7 @@ const TOOLKIT_KERNELS: &[&str] = &[
 
 /// This project's own kernels, in `cuda/maxim.cu`.
 const PROJECT_KERNELS: &[&str] = &[
+    "mx_conv1x1_t",
     "mx_conv4x4s2",
     "mx_convt2x2s2",
     "mx_gate_mm",
