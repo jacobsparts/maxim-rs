@@ -23,8 +23,8 @@ a pickle-only `.npz` checkpoint, and a model definition spread across a config
 dictionary, a module tree and an eval script. This is the same network written as
 an engine:
 
-* **One self-contained binary**: 1.92 MB with the CUDA backend (0.96 MB with it
-  compiled out). The only direct dependencies are `png` and the toolkit below -
+* **One self-contained binary**: 1.93 MB with the CUDA backend (0.96 MB with it
+  compiled out) - both sizes measured on this machine with `ls -l`. The only direct dependencies are `png` and the toolkit below -
   no image framework, no BLAS, no BLAS-shaped wrapper.
 * **The checkpoint is read, not executed.** `tools/convert.py` copies the
   `opt/target/*` leaves - the weights, about a quarter of the file, the rest is
