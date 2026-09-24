@@ -52,8 +52,10 @@ dependency at all and defaults to `--device cpu`.
 
 ## Get the weights
 
-Download the official MAXIM checkpoint (`maxim-lol.npz` or the released `.npz`
-for another task) from the [MAXIM repository](https://github.com/google-research/maxim),
+The checkpoints are published by the MAXIM authors on Google Cloud Storage, one
+directory per task and dataset -
+[`ckpt/Enhancement/LOL`](https://console.cloud.google.com/storage/browser/gresearch/maxim/ckpt/Enhancement/LOL)
+for the one this engine defaults to (MAXIM-2S, PSNR 23.43). Download the `.npz`,
 then convert it:
 
 ```sh
