@@ -408,7 +408,18 @@ __device__ __forceinline__ void mm_body(
         // value. The guard is therefore on the value, not the store.
         {
             const int n = tid;
-            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // Scalar, guarded loads rather than one float4: a float4 needs its
+            // address to be 16-byte aligned, and the address here is
+            // `(r/inner)*plane + k*inner + r%inner`, which is only aligned when
+            // `inner` is a multiple of 4. The 640x448 eval size has grid cells
+            // that are not (the square power-of-two test sizes all are, which is
+            // why this read as a working kernel until it met a real image), and a
+            // misaligned vector load is an address error at launch rather than a
+            // wrong answer. The fill is a couple of percent of this kernel's
+            // work, so a vector load here is not worth that failure mode; the
+            // WEIGHT tile below keeps its float4 only where the arithmetic proves
+            // the address is aligned.
             if (MODE0) {
                 // 16 K rows of 16 float4s each, one float4 per thread: row =
                 // n / 16, column = n % 16. (Dividing by the ROW LENGTH in floats
@@ -421,40 +432,39 @@ __device__ __forceinline__ void mm_body(
                 // columns of the tile, while `b0` is only this thread's own
                 // output column.
                 const int r = blockIdx.y * MMB + b;
-                if (k < K && r + 3 < B && (r % inner) + 3 < inner) {
-                    v = *reinterpret_cast<const float4 *>(
-                        in + (size_t)(r / inner) * plane + (size_t)k * inner + (r % inner));
-                } else if (k < K && r < B && (r % inner) + 3 >= inner) {
-                    // A channel boundary falls inside this float4, so the four
-                    // columns are not contiguous. Unreachable in this model
-                    // (`inner` is always a multiple of 64 and `r` is a multiple
-                    // of 4), but the alternative is zeroing columns that are
-                    // inside the matrix.
-                    const size_t base = (size_t)(r / inner) * plane + (size_t)k * inner + (r % inner);
-                    if ((r % inner) + 0 < inner) v.x = in[base + 0];
-                    if ((r % inner) + 1 < inner) v.y = in[base + 1];
-                    if ((r % inner) + 2 < inner) v.z = in[base + 2];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (k < K && r + j < B) {
+                        // A channel boundary can fall inside these four columns
+                        // (inner need not be a multiple of 4), which is why the
+                        // B index is decomposed per element rather than once.
+                        const int rb = r + j;
+                        v[j] = in[(size_t)(rb / inner) * plane + (size_t)k * inner + (rb % inner)];
+                    }
                 }
                 // The tile row is the K index WITHIN this chunk, `n / 16`, not
                 // `n / MMB`: the latter is the float index divided by the row
                 // length in floats and lands every thread in rows 0..3.
-                sx[mm_sx<MODE0>(b + 0, n / (MMB / 4))] = v.x;
-                sx[mm_sx<MODE0>(b + 1, n / (MMB / 4))] = v.y;
-                sx[mm_sx<MODE0>(b + 2, n / (MMB / 4))] = v.z;
-                sx[mm_sx<MODE0>(b + 3, n / (MMB / 4))] = v.w;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) sx[mm_sx<MODE0>(b + j, n / (MMB / 4))] = v[j];
             } else {
                 // 64 B rows of 16 K values; here the row index is B.
                 const int b = n / (MMK / 4);
                 const int k = (n % (MMK / 4)) * 4;
                 const int r = blockIdx.y * MMB + b;
-                if (r < B && k0 + k + 3 < K) {
-                    v = *reinterpret_cast<const float4 *>(
-                        in + (size_t)(r / outer) * plane + (size_t)(r % outer) * inner + k0 + k);
+                if (r < B) {
+                    // `inner` is the contiguous axis here, so these four K are
+                    // contiguous - but the base is `(r % outer) * inner + k0 + k`
+                    // and `inner` is not necessarily a multiple of 4.
+                    const size_t base =
+                        (size_t)(r / outer) * plane + (size_t)(r % outer) * inner + k0 + k;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        if (k0 + k + j < K) v[j] = in[base + j];
+                    }
                 }
-                sx[mm_sx<MODE0>(b, k + 0)] = v.x;
-                sx[mm_sx<MODE0>(b, k + 1)] = v.y;
-                sx[mm_sx<MODE0>(b, k + 2)] = v.z;
-                sx[mm_sx<MODE0>(b, k + 3)] = v.w;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) sx[mm_sx<MODE0>(b, k + j)] = v[j];
             }
         }
         // The weight tile, [A][K] with K contiguous.
@@ -463,21 +473,21 @@ __device__ __forceinline__ void mm_body(
             const int a = n / (MMK / 4);
             const int k = (n % (MMK / 4)) * 4;
             const int ar = blockIdx.x * MMA + a;
-            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            if (ar < A && k0 + k + 3 < K) {
-                v = *reinterpret_cast<const float4 *>(w + (size_t)ar * K + k0 + k);
-            } else if (ar < A) {
-                // A K tail shorter than 4: the weight is the only operand whose
-                // rows are contiguous in K, so the partial read has to be
-                // elementwise.
-                if (k0 + k + 0 < K) v.x = w[(size_t)ar * K + k0 + k + 0];
-                if (k0 + k + 1 < K) v.y = w[(size_t)ar * K + k0 + k + 1];
-                if (k0 + k + 2 < K) v.z = w[(size_t)ar * K + k0 + k + 2];
+            float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (ar < A) {
+                // `w + ar*K` is 16-byte aligned only when K is a multiple of 4,
+                // and the K tail here is not necessarily full, so this one is
+                // scalar too. It is a 64x16 patch per chunk against 64x64x16
+                // multiply-accumulates, so the cost of not vectorising it is
+                // noise next to the risk of an unaligned load.
+                const size_t base = (size_t)ar * K + k0 + k;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (k0 + k + j < K) v[j] = w[base + j];
+                }
             }
-            sw[a * (MMK + 1) + k + 0] = v.x;
-            sw[a * (MMK + 1) + k + 1] = v.y;
-            sw[a * (MMK + 1) + k + 2] = v.z;
-            sw[a * (MMK + 1) + k + 3] = v.w;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) sw[a * (MMK + 1) + k + j] = v[j];
         }
         __syncthreads();
 

@@ -114,6 +114,10 @@ fn run(
     let (Some(input), Some(model)) = (input, model) else {
         usage()
     };
+    // `--legacy-ops` chooses between the tiled and the original kernels, which
+    // only exist in a GPU build.
+    #[cfg(not(feature = "cuda"))]
+    let _ = legacy_ops;
     let cfg = match &variant {
         Some(v) => Config::variant(v)?,
         None => Config::for_task(task)?,
@@ -243,7 +247,6 @@ fn run(
 }
 
 /// Where the GPU time went, grouped by op kind.
-///
 ///
 /// The per-op numbers come from a CUDA event around each op, so they are device
 /// time and they sum to the run. What matters is the SHARE: the graph is 1840

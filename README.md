@@ -23,7 +23,7 @@ a pickle-only `.npz` checkpoint, and a model definition spread across a config
 dictionary, a module tree and an eval script. This is the same network written as
 an engine:
 
-* **One self-contained binary**: 1.52 MB with the CUDA backend (0.96 MB with it
+* **One self-contained binary**: 1.92 MB with the CUDA backend (0.96 MB with it
   compiled out). The only direct dependencies are `png` and the toolkit below -
   no image framework, no BLAS, no BLAS-shaped wrapper.
 * **The checkpoint is read, not executed.** `tools/convert.py` copies the
@@ -118,14 +118,14 @@ engine could be validated at all:
 * `--dump <dir>` writes 43 named activations; `tools/compare.py` diffs two dump
   directories. Running it against `tools/reference.py` (a PyTorch transcription
   of the same model, kept in the repo as a development tool) gives 43 of 43
-  tensors matching, most above 100 dB and the worst at 121 dB, max abs 9.1e-6.
+  tensors matching, most above 100 dB and the worst at 121 dB, max abs 9.3e-6.
 * `--verify-gpu` runs the plan **one op at a time on both backends** and compares
   each op's destination between them. It is the difference between "the whole
   model is wrong" and "op 384 is wrong": the two comparisons above say nothing
   about where a divergence starts, and the one bug this path had turned out to be
   a single kernel's channel stride - reported as op 384 of 1840, the first resize
   in the graph, by a tool that named it in one run. It reports 1840 ops, 0
-  disagreements beyond 1e-3 relative, worst 8.1e-5 - i.e. f32 accumulation order.
+  disagreements beyond 1e-3 relative, worst 6.4e-5 - i.e. f32 accumulation order.
 * `MAXIM_TRACE=1` prints one line per op with its operand labels, and
   `MAXIM_DEEP_DUMPS=1` (on the engine and on `reference.py`) turns on ~750
   per-block-internal activations, which localise a divergence to a single line of
@@ -137,16 +137,51 @@ engine could be validated at all:
 
 Both backends sit on [lightgpu](https://github.com/jacobsparts/lightgpu), a small
 library of hand-written CUDA kernels plus the driver plumbing to launch them -
-not a wrapper around cuDNN or cuBLAS. MAXIM calls six of the toolkit's kernels
-(`lg_conv1x1`, `lg_conv3x3s1p1`, `lg_add`, `lg_channel_layer_norm`,
-`lg_gelu_erf`, `lg_lrelu`) and ships the eleven it needs that the toolkit does
-not have in `cuda/maxim.cu`: the padded stride-2 4x4 conv and its transposed twin,
-the blocked-layout gating matmul, the space/block permutation, the two-pass
-bilinear resize, the channel mean and scale, and a handful of elementwise ops.
-An `Op::Copy` is a device-to-device memcpy rather than a launch, which is faster
-for the row copies the model does; the toolkit's `lg_copy` is therefore compiled
-out. A kernel with no caller is bytes in the binary, so the lists name only what
-an op actually launches.
+not a wrapper around cuDNN or cuBLAS. MAXIM calls the toolkit's `lg_add`,
+`lg_channel_layer_norm`, `lg_gelu_erf` and `lg_lrelu` and ships the rest of what
+it needs in `cuda/maxim.cu`: the padded stride-2 4x4 conv and its transposed twin,
+the space/block permutation, the two-pass bilinear resize, the channel mean and
+scale, and a handful of elementwise ops. An `Op::Copy` is a device-to-device
+memcpy rather than a launch, which is faster for the row copies the model does; the
+toolkit's `lg_copy` is therefore compiled out, and the lists name only what an op can
+launch. The two toolkit kernels the tiled forms replaced are the exception: every
+kernel in the list is still linked and still launchable under `--legacy-ops`, because
+a before-and-after from one binary is worth more than a few kilobytes.
+
+Three op families are the whole cost of this model, and all three were written the
+same naive way: **one thread per output element**, which re-reads every operand for
+every output. Each now has a tiled kernel that keeps the reuse in registers and
+shared memory, and each original is still linked, so the difference is measured
+rather than asserted (`--legacy-ops` runs the originals):
+
+| op | original | tiled | at 512x512 |
+| --- | --- | --- | --- |
+| 1x1 conv (444 ops) | `lg_conv1x1` | `mx_conv1x1_t` | 5.39 -> 1.56 ms/op |
+| gating matmul (112 ops) | `mx_gate_mm` | `mx_gate_mm_t0`/`_t1` | 18.8 -> 0.89 ms/op |
+| 3x3 conv (66 ops) | `lg_conv3x3s1p1` | `mx_conv3x3_t4`/`_t2` | 28.8 -> 3.42 ms/op |
+
+The 1x1 conv put one thread on each output and walked its input column one
+`plane`-strided float at a time, so it moved about `c_in` times the traffic the op
+needs and ran at 199 GFLOP/s of this card's 8.9 TFLOP/s. Four output channels per
+thread, over a transposed `[c_in][c_out]` weight, makes one input load feed four
+outputs and brings it to the memory roofline instead - which is where it now sits
+(288 GB/s of ~320 GB/s available). An ablation settles where the gain came from: the
+same kernel with one channel per thread measures 5.35 ms/op, i.e. all of the 3.4x
+is the tiling, none of it the transposed layout. That layout is still what makes a
+multi-channel inner loop possible, and the GPU plan carries the transposed twin of
+every 1x1 weight for it (74.1 MiB of weights rather than 54.1).
+
+The gating matmul is an implicit GEMM: both of the gMLP's modes reduce one spatial
+axis of a `[c][outer][inner]` tensor, so the same body covers them, with the tile
+FILLED differently per mode and read through one index helper. A 64x64 output tile
+with a 16-deep K chunk means one activation load feeds four outputs and one weight
+load four more, in place of one of each per output.
+
+The 3x3 conv tiles a 64-pixel segment of one row plus a one-column halo per input
+channel, so a 3x3 window is three offsets into the same shared tile: about 47 MACs
+per load instead of 1. Its accumulation order (`dy`, `dx`, `ci`) is the original's,
+which is why the tiled form agrees with the CPU more closely than the original did
+(worst relative disagreement 6.4e-5, down from 8.1e-5).
 
 Kernels are compiled per consumer: `build.rs` gives `nvcc` an explicit `--entries`
 list for each fatbin, so the binary embeds only the kernels this engine can call.
@@ -155,49 +190,57 @@ rather than at build time, so the build script checks the list and the source
 against each other in both directions - a typo fails the build, and so does a
 kernel defined but not listed.
 
-The graph is not the bottleneck for this model, the kernel count is: MAXIM is
-1840 small ops rather than a handful of large GEMMs, and at 5 ms per op the run is
-dominated by the launch/sync path. The arena is one allocation, so the 2089
-buffers cost no allocation traffic at all.
+The graph is still 1840 small ops rather than a handful of large GEMMs, and with the
+three families tiled the remaining time is spread thin rather than concentrated: at
+640x448 the largest share is the 3x3 conv at 30%, the 1x1 conv is 24% and every
+elementwise op in the graph together is 3.5%. `--profile` prints that breakdown,
+per op and per family, from CUDA events around each op. The arena is one allocation,
+so the 2089 buffers cost no allocation traffic at all.
 
 ## Performance
 
-Measured on a GTX 1080 (sm_61) and an i7-13700K, for one 600x400 image from the
-LOL eval set (padded to 640x448, 1840 ops):
+Measured on a GTX 1080 (sm_61) and an i7-13700K, for one 600x400 image from the LOL
+eval set (padded to 640x448, 1840 ops):
 
 | | time | per op | arena |
 | --- | --- | --- | --- |
-| `--device gpu` | 9.4 s | 5 ms | 942.7 MiB |
-| `--device cpu` | 158 s | 86 ms | 942.7 MiB |
+| `--device gpu` | 3.6 s | 2.0 ms | 942.7 MiB |
+| `--device gpu --legacy-ops` | 9.0 s | 4.9 ms | 942.7 MiB |
+| `--device cpu` | 155 s | 84 ms | 942.7 MiB |
 
-The GPU figure is steady-state: the card parks at 139 MHz between runs, and the
-first run after an idle period takes about 20 s while it ramps to its 1835 MHz
-boost clock. Take any single measurement of a run this short with that in mind.
+The legacy row is the same binary with the kernels as they were before the tiling
+work in the previous section. That is the honest way to state a 2.5x: both numbers
+come from one build, so neither has to be taken on trust.
+
+The GPU figure is steady-state. The card parks at 139 MHz between runs and the first
+run after an idle period takes about 20 s while it ramps to its 1835 MHz boost
+clock, so a single measurement of a run this short has to be read with that in mind.
 The CPU figure is one core at 99% CPU - the CPU executor is serial, one op at a
-time - which `--profile` and the arena explain: the graph is 1840 separately
-executed ops, so on the GPU the cost is the launch and on the CPU it is the
+time, and it walks the same op list rather than a fused graph, so it pays both the
 per-op dispatch and a cold 942 MiB arena.
 
-For scale, the reference `tools/reference.py` (PyTorch 2.6, same machine, same
-image) takes 0.92 s on the same card and 6.9 s on 16 CPU threads. That gap is not
-a kernel that is 10x slow: it is 1840 small ops with a launch each, against a
-library that fuses and batches the same arithmetic. The engine's kernels are
-compared per op against this reference (see Accuracy) rather than assumed.
+For scale, `tools/reference.py` - a PyTorch transcription of the same model, kept in
+the repo as a development tool, and pure CPU, with no `.cuda()` in it - takes 7.7 s
+wall at 1443% CPU (16 threads) on the same image. The engine and the reference are
+now in the same range, arriving from opposite directions: torch wins by fusing and
+batching 1840 ops into a few large kernels, and this engine pays a launch per op but
+has kernels tiled for its own shapes.
 
-Single-image time is close to linear in the input's area, which is what the
-per-op dispatch term predicts:
+Single-image time is close to linear in the input's area:
 
-| input | `--device gpu` |
-| --- | --- |
-| 128x128 | 0.43 s |
-| 256x256 | 1.83 s |
-| 384x384 | 4.58 s |
-| 512x512 | 8.38 s |
+| input | `--device gpu` | with `--legacy-ops` |
+| --- | --- | --- |
+| 128x128 | 0.27 s | 0.43 s |
+| 256x256 | 0.64 s | 1.83 s |
+| 384x384 | 1.64 s | 4.58 s |
+| 512x512 | 2.60 s | 8.38 s |
 
 The arena is a function of the padded input size, not of the model: a 128x128 crop
-needs 53.9 MiB, and 600x400 is the largest size the eval set contains. There is
-no tiling yet; the whole feature map lives in the arena, so a large image needs a
-card that can hold it. The weights are 54.1 MiB on either backend.
+needs 53.9 MiB, and 600x400 is the largest size the eval set contains. The feature
+map is not tiled, so the whole of it lives in the arena and a large image needs a
+card that can hold it. The weights are 74.1 MiB on the GPU plan and 54.1 MiB on the
+CPU-only one, the difference being the transposed 1x1 weights that only the GPU
+kernel reads.
 
 ## Accuracy
 
@@ -209,14 +252,22 @@ engine's dump and `reference.py`'s, on two input sizes, on both backends:
 
 | input | tensors | worst max abs | worst PSNR | backend agreement (`--verify-gpu`) |
 | --- | --- | --- | --- | --- |
-| 128x128 crop | 43 of 43, 0 failed | 9.1e-6 | 121 dB | 1840 ops, 0 beyond 1e-3 relative, worst 8.1e-5 |
-| 256x256 crop | 43 of 43, 0 failed | 1.1e-5 | 118 dB | 1840 ops, 0 beyond 1e-3 relative, worst 3.0e-4 |
+| 128x128 crop | 43 of 43, 0 failed | 9.3e-6 | 121 dB | 1840 ops, 0 beyond 1e-3 relative, worst 6.4e-5 |
+| 256x256 crop | 43 of 43, 0 failed | 1.2e-5 | 118 dB | 1840 ops, 0 beyond 1e-3 relative, worst 3.0e-4 |
+| 640x448 (a real eval image) | - | - | - | 1840 ops, 0 beyond 1e-3 relative, worst 1.5e-4 |
 
-Both sizes are 43 of 43 with nothing below 100 dB. The backend disagreement grows
-with tensor size - 8.1e-5 at 128x128, 3.0e-4 at 256x256 - which is what f32
+The 640x448 row is there because it is the size the model actually runs on, and
+because the square powers of two above hid a real bug: the tiled gating matmul's
+first version loaded its tile with `float4`s, which is only legal where the
+address is 16-byte aligned - true for every square size, false for the grid cell
+counts a 640x448 image produces, where it faulted at launch. It is now scalar and
+guarded, and the fills are a few percent of that kernel's work.
+
+Both dump sizes are 43 of 43 with nothing below 100 dB. The backend disagreement grows
+with tensor size - 6.4e-5 at 128x128, 3.0e-4 at 256x256 - which is what f32
 accumulation order does when there are more terms to sum in a different sequence,
 not a widening algorithmic gap: the bar is 1e-3 relative to each buffer's own
-magnitude, and neither size comes close.
+magnitude, and no size comes close.
 
 **Parity is not correctness.** Both backends walk the same op list, so a mistake
 in the plan - a transposed weight, a swapped axis, a block that is never applied -
@@ -246,10 +297,13 @@ non-zero on either.
 **Known infidelities**, all far below 8-bit output precision and deliberately not
 chased:
 
-* `lg_conv1x1` and `lg_conv3x3s1p1` accumulate in `(oc, ic)` order where the
-  reference's implicit GEMM accumulates in its own blocked order, and
-  `mx_gate_mm`'s per-element order differs from an einsum's. These show up as
-  1e-6-level differences, not as a PSNR gap.
+* The 1x1 conv accumulates over input channels where the reference's implicit GEMM
+  accumulates in its own blocked order, and the gating matmul's per-element order
+  differs from an einsum's. These show up as 1e-6-level differences, not as a PSNR
+  gap. Tiling a kernel also changes the order the terms are summed in - the transposed
+  1x1 kernel keeps four running sums where the original kept one - which is exactly
+  what the 1e-3 relative bar exists to absorb. The 3x3 conv's order (`dy`, `dx`, `ci`)
+  was deliberately preserved, and its agreement improved as a result.
 * The multi-scale input pyramid uses jax's nearest-neighbour rule - output `i`
   takes `floor((i + 0.5) * m / n)`, so a 2x downsample keeps the ODD rows - where
   torch's `interpolate(mode="nearest")` keeps the even ones. The engine implements
@@ -265,8 +319,8 @@ src/config.rs    the variant table and the task -> variant mapping
 src/weights.rs   safetensors reader and the kernel-layout transposes
 src/image.rs     PNG in/out, padding and the crop back
 src/host.rs      the host-side arena, weights and named activations
-src/main.rs      the CLI, --dump, --profile and --verify-gpu
-cuda/maxim.cu    this engine's eleven kernels
+src/main.rs      the CLI, --dump, --profile, --legacy-ops and --verify-gpu
+cuda/maxim.cu    this engine's own kernels (sixteen, incl. the tiled forms)
 tools/reference.py  a PyTorch transcription of the same model (the reference)
 tools/compare.py    diff two --dump directories
 tools/eval.py       PSNR against the LOL ground truth, optionally vs the reference

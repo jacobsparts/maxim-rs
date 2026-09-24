@@ -132,16 +132,30 @@ pub struct WeightCache {
     bufs: Vec<Option<Buf>>,
     hits: usize,
     uploads: usize,
+    /// Total weight bytes the device has been asked for, whether or not it is
+    /// resident: `resident_bytes` counts what a successful run left allocated,
+    /// which is not what a run that ran out of memory needs to know.
+    wanted_bytes: usize,
 }
 
 impl WeightCache {
     pub fn new(n: usize) -> WeightCache {
-        WeightCache { bufs: (0..n).map(|_| None).collect(), hits: 0, uploads: 0 }
+        WeightCache { bufs: (0..n).map(|_| None).collect(), hits: 0, uploads: 0, wanted_bytes: 0 }
     }
 
     pub fn get(&mut self, id: usize, host: &[Vec<f32>]) -> Result<&Buf, Error> {
         if self.bufs[id].is_none() {
-            let mut b = Buf::new(host[id].len())?;
+            self.wanted_bytes += host[id].len() * 4;
+            // An allocation failure here is the small-card failure mode, and
+            // "cuMemAlloc failed" alone does not say how much was wanted.
+            let mut b = Buf::new(host[id].len()).map_err(|e| {
+                Error(format!(
+                    "weight blob {id}: {} MiB, {:.1} MiB of weights wanted so far: {e}",
+                    host[id].len() * 4 / 1048576,
+                    self.wanted_bytes as f64 / 1048576.0
+                )
+                .into())
+            })?;
             b.upload(&host[id])?;
             self.bufs[id] = Some(b);
             self.uploads += 1;
