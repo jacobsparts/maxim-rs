@@ -120,11 +120,12 @@ engine could be validated at all:
   of the same model, kept in the repo as a development tool) gives 43 of 43
   tensors matching, most above 100 dB and the worst at 121 dB, max abs 9.1e-6.
 * `--verify-gpu` runs the plan **one op at a time on both backends** and compares
-  each op's destination between them. It is the difference between "the GPU plot
-  is wrong" and "op 384 is wrong": the whole-model diff says nothing about where
-  the disagreement starts, and a planted bug that cost 14 dB turned out to be a
-  single kernel's stride. It reports 1840 ops, 0 disagreements beyond 1e-3
-  relative, worst 8.1e-5 - i.e. f32 accumulation order.
+  each op's destination between them. It is the difference between "the whole
+  model is wrong" and "op 384 is wrong": the two comparisons above say nothing
+  about where a divergence starts, and the one bug this path had turned out to be
+  a single kernel's channel stride - reported as op 384 of 1840, the first resize
+  in the graph, by a tool that named it in one run. It reports 1840 ops, 0
+  disagreements beyond 1e-3 relative, worst 8.1e-5 - i.e. f32 accumulation order.
 * `MAXIM_TRACE=1` prints one line per op with its operand labels, and
   `MAXIM_DEEP_DUMPS=1` (on the engine and on `reference.py`) turns on ~750
   per-block-internal activations, which localise a divergence to a single line of
