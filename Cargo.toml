@@ -20,9 +20,11 @@ cuda = []
 
 [dependencies]
 png = "0.17"
-rayon = "1"
-libc = "0.2"
 # Driver layer, module/launch/buffer plumbing and the generic kernel set.
+# `libc` and `rayon` are deliberately NOT here: the toolkit owns the dlopen
+# driver layer and the mmapping, and the CPU executor is serial (one op at a
+# time, in graph order) because it doubles as the reference the GPU backend is
+# diffed against. Neither crate was referenced by any source file.
 lightgpu = { git = "https://github.com/jacobsparts/lightgpu.git" }
 
 [build-dependencies]

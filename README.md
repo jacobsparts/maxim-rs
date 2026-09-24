@@ -24,8 +24,8 @@ dictionary, a module tree and an eval script. This is the same network written a
 an engine:
 
 * **One self-contained binary**: 1.52 MB with the CUDA backend (0.96 MB with it
-  compiled out). The direct dependencies are `png`, `rayon` and `libc`, plus the
-  toolkit below.
+  compiled out). The only direct dependencies are `png` and the toolkit below -
+  no image framework, no BLAS, no BLAS-shaped wrapper.
 * **The checkpoint is read, not executed.** `tools/convert.py` copies the
   `opt/target/*` leaves - the weights, about a quarter of the file, the rest is
   optimizer state - into the standard `.safetensors` container once. At run time
@@ -162,17 +162,37 @@ buffers cost no allocation traffic at all.
 
 ## Performance
 
-Measured on a GTX 1080 (sm_61) and 24 CPU threads, for one 600x400 image from the
+Measured on a GTX 1080 (sm_61) and an i7-13700K, for one 600x400 image from the
 LOL eval set (padded to 640x448, 1840 ops):
 
 | | time | per op | arena |
 | --- | --- | --- | --- |
 | `--device gpu` | 9.4 s | 5 ms | 942.7 MiB |
-| `--device cpu` | 160 s | 87 ms | 942.7 MiB |
+| `--device cpu` | 158 s | 86 ms | 942.7 MiB |
 
 The GPU figure is steady-state: the card parks at 139 MHz between runs, and the
 first run after an idle period takes about 20 s while it ramps to its 1835 MHz
 boost clock. Take any single measurement of a run this short with that in mind.
+The CPU figure is one core at 99% CPU - the CPU executor is serial, one op at a
+time - which `--profile` and the arena explain: the graph is 1840 separately
+executed ops, so on the GPU the cost is the launch and on the CPU it is the
+per-op dispatch and a cold 942 MiB arena.
+
+For scale, the reference `tools/reference.py` (PyTorch 2.6, same machine, same
+image) takes 0.92 s on the same card and 6.9 s on 16 CPU threads. That gap is not
+a kernel that is 10x slow: it is 1840 small ops with a launch each, against a
+library that fuses and batches the same arithmetic. The engine's kernels are
+compared per op against this reference (see Accuracy) rather than assumed.
+
+Single-image time is close to linear in the input's area, which is what the
+per-op dispatch term predicts:
+
+| input | `--device gpu` |
+| --- | --- |
+| 128x128 | 0.43 s |
+| 256x256 | 1.83 s |
+| 384x384 | 4.58 s |
+| 512x512 | 8.38 s |
 
 The arena is a function of the padded input size, not of the model: a 128x128 crop
 needs 53.9 MiB, and 600x400 is the largest size the eval set contains. There is
