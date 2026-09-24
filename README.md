@@ -184,14 +184,18 @@ The engine is checked in three ways, each of which catches something the others
 cannot.
 
 **Parity with the reference, per activation.** `tools/compare.py` between the
-engine's dump and `reference.py`'s, for a 128x128 crop:
+engine's dump and `reference.py`'s, on two input sizes, on both backends:
 
-| | |
-| --- | --- |
-| tensors compared | 43 of 43, 0 failed |
-| worst max abs | 9.1e-6 (stage1 encoder output) |
-| worst PSNR | 121 dB |
-| backend agreement | 1840 ops, 0 beyond 1e-3 relative, worst 8.1e-5 |
+| input | tensors | worst max abs | worst PSNR | backend agreement (`--verify-gpu`) |
+| --- | --- | --- | --- | --- |
+| 128x128 crop | 43 of 43, 0 failed | 9.1e-6 | 121 dB | 1840 ops, 0 beyond 1e-3 relative, worst 8.1e-5 |
+| 256x256 crop | 43 of 43, 0 failed | 1.1e-5 | 118 dB | 1840 ops, 0 beyond 1e-3 relative, worst 3.0e-4 |
+
+Both sizes are 43 of 43 with nothing below 100 dB. The backend disagreement grows
+with tensor size - 8.1e-5 at 128x128, 3.0e-4 at 256x256 - which is what f32
+accumulation order does when there are more terms to sum in a different sequence,
+not a widening algorithmic gap: the bar is 1e-3 relative to each buffer's own
+magnitude, and neither size comes close.
 
 **Parity is not correctness.** Both backends walk the same op list, so a mistake
 in the plan - a transposed weight, a swapped axis, a block that is never applied -
