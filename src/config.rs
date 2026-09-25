@@ -58,6 +58,47 @@ impl Config {
         })
     }
 
+    /// The variant a checkpoint was trained with, read from the file.
+    ///
+    /// THE ARCHITECTURE IS A PROPERTY OF THE MODEL, NOT A FLAG. Three things
+    /// separate the six variants and all three are visible in the weights: the
+    /// feature width is the second dimension of the first conv's kernel, the
+    /// stage count is how many `stage_N_*` groups exist, and the task is in the
+    /// checkpoint's own `__metadata__` when `tools/convert.py` put it there. A
+    /// caller who passed the wrong variant by hand would build a graph that reads
+    /// parameters the file does not have, and would fail deep inside the builder
+    /// rather than at the door, so there is no flag for it.
+    pub fn of_checkpoint(file: &lightgpu::safetensors::File) -> Result<Config, crate::Error> {
+        // The width is `c_out` of the first encoder conv, which is the one
+        // parameter no other variant of a different width shares a shape with.
+        let name = "stage_0_encoder_block_0/Conv_0/kernel";
+        let s = file.shape(name).map_err(|_| -> crate::Error {
+            format!("{name} is missing (not a converted MAXIM checkpoint?)").into()
+        })?;
+        let features = *s.last().unwrap_or(&0);
+        let mut stages = 1;
+        for n in 1..3 {
+            if file.contains(&format!("stage_{n}_output_conv_1/kernel")) {
+                stages = n + 1;
+            }
+        }
+        let variant = match (features, stages) {
+            (32, 1) => "S-1",
+            (32, 2) => "S-2",
+            (32, 3) => "S-3",
+            (64, 1) => "M-1",
+            (64, 2) => "M-2",
+            (64, 3) => "M-3",
+            _ => {
+                return Err(format!(
+                    "checkpoint has {features} features and {stages} stage(s), which is not one of the six published MAXIM variants"
+                )
+                .into())
+            }
+        };
+        Config::variant(variant)
+    }
+
     /// `_MODEL_VARIANT_DICT`: the variant the released checkpoint for a task was
     /// trained with.
     pub fn for_task(task: &str) -> Result<Config, crate::Error> {
@@ -91,9 +132,4 @@ impl Config {
         (1 << level) * self.features
     }
 
-    pub fn n_stage_fuse(&self, stage: usize) -> usize {
-        // stage > 0 fuses the previous stage's SAM features; the parameter names
-        // in the checkpoint are stage_{s}_input_fuse_sam_{i}.
-        stage
-    }
 }

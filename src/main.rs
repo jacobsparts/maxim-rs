@@ -1,67 +1,92 @@
 //! `maxim`: restore one image with a MAXIM checkpoint.
 //!
-//!     maxim --model maxim-lol.safetensors -i low.png -o high.png
-//!     maxim --model ... -i low.png --device cpu        # pure Rust, no driver
-//!     maxim --model ... -i low.png --dump out/         # every named activation
+//!     maxim -m maxim-lol.safetensors -i low.png -o high.png
+//!     maxim -m maxim-lol.safetensors -i low.png -o high.png --device cpu
 //!
 //! The engine builds a plan for the padded input shape, runs it on the chosen
 //! backend, and crops the result back the way the reference eval script does.
 
-use maxim::config::Config;
 use maxim::host::Host;
 use maxim::image;
 use maxim::model::Builder;
 use maxim::weights::Weights;
 use std::time::Instant;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn usage() -> ! {
     eprintln!(
-        "maxim - MAXIM image restoration (denoise, deblur, derain, dehaze, enhance)
+        "maxim {VERSION} - MAXIM image restoration on lightgpu
 
-USAGE
-  maxim --model <weights.safetensors> -i <input.png> [-o <output.png>] [options]
+USAGE:
+    maxim --model <weights.safetensors> -i <in.png> -o <out.png> [options]
 
-OPTIONS
-  -i, --input <path>    input image (PNG)
-  -o, --output <path>   output image (PNG); omitted means run and discard
-  -m, --model <path>    weights (safetensors, from tools/convert.py)
-      --task <name>     enhancement (default), denoising, deblurring, deraining,
-                        dehazing - selects the variant the checkpoint was trained
-                        with
-      --variant <v>     S-1..S-3, M-1..M-3, overriding --task
-      --device <d>      gpu (default) or cpu
-      --factor <n>      pad the input to a multiple of n (default 64, as the
-                        reference eval script does)
-      --dump <dir>      write every named activation as .npy for the parity tool
-      --profile         report the plan's size, op count and where the GPU time
-                        went, per op and per op kind (MAXIM_TIMELINE=1 does the
-                        same thing)
-      --legacy-ops      use the kernels as they were before the tiling work, so
-                        the speedup can be measured (MAXIM_LEGACY_OPS=1 too)
-      --verify-gpu      run the plan ONE OP AT A TIME on the CPU and the GPU,
-                        comparing each op's destination between them; reports the
-                        first op where they disagree. `--device` is ignored.
-  -h, --help            this text
-"
+OPTIONS:
+    -m, --model <path>    converted .safetensors checkpoint (see tools/convert.py)
+    -i, --input <path>    input PNG, or - for stdin (default: stdin)
+    -o, --output <path>   output PNG, or - for stdout (default: stdout)
+        --device <dev>    gpu or cpu (default: gpu when the CUDA driver can be
+                          brought up, cpu otherwise; a CPU-only build is always
+                          cpu)
+        --cpu             same as --device cpu
+        --gpu             same as --device gpu, and refuses to fall back
+    -q, --quiet           no progress output
+    -h, --help            this text
+    -V, --version         print the version"
+    );
+    // THE DEVELOPMENT FLAGS ARE LISTED ONLY BY A BINARY THAT HAS THEM. Help text
+    // that advertises an option the parser rejects is worse than no help: a
+    // caller reads the list, passes a flag, and gets a refusal it was told would
+    // work.
+    #[cfg(feature = "dev")]
+    eprintln!(
+        "
+DEVELOPMENT ONLY (this build has `--features dev`; a release build has none of
+these, and rejects them by name):
+        --dump <dir>      write every named activation as .npy, for
+                          tools/compare.py against the reference
+        --profile         report where the time went, per op kind and per shape
+                          (the same table for both backends; MAXIM_TIMELINE=1
+                          does it for the GPU too)
+        --verify-gpu      run the plan ONE OP AT A TIME on the CPU and the GPU,
+                          comparing each op's destination between them, and
+                          report the first op where they disagree
+        --factor <n>      pad the input to a multiple of n (default 64, as the
+                          reference eval script does)"
     );
     std::process::exit(2)
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mut input = None;
-    let mut output = None;
-    let mut model = None;
-    let mut task = "enhancement".to_string();
-    let mut variant = None;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        usage();
+    }
+    let mut model: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    // A CPU-only build has no GPU backend to default to, so it defaults to the
+    // one it can actually run.
     let mut device = if cfg!(feature = "cuda") { "gpu" } else { "cpu" }.to_string();
+    // Set only when the caller NAMED the GPU. Without it, a GPU that cannot be
+    // brought up is not fatal: the engine falls back to the CPU backend, which
+    // is what lets one binary run on a machine with no NVIDIA driver at all.
+    let mut force_gpu = false;
+    let mut quiet = false;
+    // DEV-ONLY STATE, AND ITS ABSENCE IS WHAT KEEPS THE FLAGS OUT. A release
+    // build has no flag that sets any of these, so the variables do not exist in
+    // it - which also means a later edit cannot re-expose a development flag by
+    // wiring it to state that is still being parsed.
+    #[cfg(feature = "dev")]
     let mut factor = 64usize;
+    #[cfg(feature = "dev")]
     let mut dump: Option<String> = None;
+    #[cfg(feature = "dev")]
     let mut profile = false;
+    #[cfg(feature = "dev")]
     let mut verify_gpu = false;
-    let mut legacy_ops = std::env::var_os("MAXIM_LEGACY_OPS").is_some();
 
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         let next = |i: &mut usize| -> String {
@@ -69,153 +94,280 @@ fn main() {
             args.get(*i).cloned().unwrap_or_else(|| usage())
         };
         match a {
+            "-m" | "--model" => model = Some(next(&mut i)),
             "-i" | "--input" => input = Some(next(&mut i)),
             "-o" | "--output" => output = Some(next(&mut i)),
-            "-m" | "--model" => model = Some(next(&mut i)),
-            "--task" => task = next(&mut i),
-            "--variant" => variant = Some(next(&mut i)),
-            "--device" => device = next(&mut i),
-            "--factor" => factor = next(&mut i).parse().unwrap_or(64),
+            "--device" => {
+                device = next(&mut i);
+                force_gpu = device == "gpu";
+            }
+            "--cpu" => device = "cpu".to_string(),
+            "--gpu" => {
+                device = "gpu".to_string();
+                force_gpu = true;
+            }
+            "-q" | "--quiet" => quiet = true,
+            // THE DEVELOPMENT FLAGS, AND ONLY A DEVELOPMENT BUILD HAS THEM. A
+            // release build refuses them BY NAME rather than ignoring them,
+            // which matters most for `--dump`: a script that asked for a dump
+            // and did not get one must not carry on as if it had.
+            #[cfg(feature = "dev")]
             "--dump" => dump = Some(next(&mut i)),
+            #[cfg(feature = "dev")]
             "--profile" | "--timeline" => profile = true,
-            // The pre-tiling kernels are still in the binary, so the speedup is a
-            // measurement rather than a claim.
-            "--legacy-ops" => legacy_ops = true,
+            #[cfg(feature = "dev")]
             "--verify-gpu" => verify_gpu = true,
+            #[cfg(feature = "dev")]
+            "--factor" => factor = next(&mut i).parse().unwrap_or(64),
+            #[cfg(not(feature = "dev"))]
+            "--dump" | "--profile" | "--timeline" | "--verify-gpu" | "--factor" => {
+                eprintln!("maxim: `{a}` is a development flag and this is a release build");
+                eprintln!("maxim: rebuild with `cargo build --release --features dev` for");
+                eprintln!("maxim: --dump, --profile, --verify-gpu and --factor");
+                std::process::exit(2);
+            }
             "-h" | "--help" => usage(),
+            "-V" | "--version" => {
+                println!("maxim {VERSION}");
+                return;
+            }
             other => {
-                eprintln!("maxim: unknown option {other}");
-                usage()
+                eprintln!("maxim: unknown argument `{other}`");
+                usage();
             }
         }
         i += 1;
     }
 
-    if let Err(e) = run(input, output, model, &task, variant, &device, factor, dump, profile, verify_gpu, legacy_ops) {
+    let model = model.unwrap_or_else(|| {
+        eprintln!("maxim: --model is required (see tools/convert.py)");
+        usage()
+    });
+
+    #[cfg(feature = "dev")]
+    let dev = Dev { factor, dump, profile, verify_gpu };
+    #[cfg(not(feature = "dev"))]
+    let dev = Dev;
+
+    if let Err(e) = run(&model, input.as_deref(), output.as_deref(), &device, force_gpu, quiet, dev)
+    {
         eprintln!("maxim: {e}");
         std::process::exit(1)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    input: Option<String>,
-    output: Option<String>,
-    model: Option<String>,
-    task: &str,
-    variant: Option<String>,
-    device: &str,
+/// The development-only knobs, so that `run` can be written once. A release
+/// build's `Dev` has no fields and `run` reads them as constants, which is what
+/// keeps the development paths out of a release binary rather than merely
+/// unreachable in it.
+#[cfg(feature = "dev")]
+struct Dev {
     factor: usize,
     dump: Option<String>,
     profile: bool,
     verify_gpu: bool,
-    legacy_ops: bool,
+}
+#[cfg(not(feature = "dev"))]
+struct Dev;
+
+#[allow(clippy::too_many_arguments)]
+fn run(
+    model: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+    device: &str,
+    force_gpu: bool,
+    quiet: bool,
+    dev: Dev,
 ) -> Result<(), maxim::Error> {
-    let (Some(input), Some(model)) = (input, model) else {
-        usage()
-    };
-    // `--legacy-ops` chooses between the tiled and the original kernels, which
-    // only exist in a GPU build.
-    #[cfg(not(feature = "cuda"))]
-    let _ = legacy_ops;
-    let cfg = match &variant {
-        Some(v) => Config::variant(v)?,
-        None => Config::for_task(task)?,
-    };
+    #[cfg(feature = "dev")]
+    let (factor, dump, profile, verify_gpu) =
+        (dev.factor, dev.dump.clone(), dev.profile, dev.verify_gpu);
+    // A RELEASE BUILD'S `Dev` IS A UNIT STRUCT AND THESE ARE CONSTANTS. That is
+    // the point of the split: the development paths below are not "unreachable
+    // at run time", they are not compiled, so a release binary has no code that
+    // could act on a dump directory or a pad multiple even if it were handed
+    // one. `factor` is the only one of the four that has a life outside a
+    // development build - the reference eval script pads by 64 and so does this
+    // engine, unconditionally, and a caller who could change it would be able to
+    // produce an image that does not match the published pipeline.
+    #[cfg(not(feature = "dev"))]
+    let (factor, _dump, profile, _verify_gpu) = (64usize, None::<String>, false, false);
+    // The unit `Dev` is all a release build has left of the development flags.
+    #[cfg(not(feature = "dev"))]
+    let _ = dev;
 
-    let img = image::read_png(&input)?;
+    // THE CHECKPOINT SAYS WHAT IT IS. The variant is a property of the file, not
+    // a flag: `Weights::open` derives it from the weights, so a mismatched
+    // `--variant` cannot build a graph that reads parameters which are not there.
+    let w = Weights::open(model)?;
+    let cfg = w.config.clone();
+
+    // The image. `-` or absent means stdin, so the engine drops into a shell
+    // pipeline without a temporary file.
+    let img = match input {
+        None | Some("-") => {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("read stdin: {e}"))?;
+            image::read_png_stream(&buf[..], "stdin")?
+        }
+        Some(p) => image::read_png(p)?,
+    };
     let padded = image::preprocess(&img, factor);
-    println!(
-        "input {}x{} -> padded {}x{} (even {}x{}), {} stage(s), features {}",
-        img.w, img.h, padded.img.w, padded.img.h, padded.even_w, padded.even_h,
-        cfg.num_stages, cfg.features
-    );
+    if !quiet {
+        eprintln!(
+            "maxim {VERSION}: {}x{} -> padded {}x{} (even {}x{}), {} stage(s), features {}",
+            img.w, img.h, padded.img.w, padded.img.h, padded.even_w, padded.even_h,
+            cfg.num_stages, cfg.features
+        );
+    }
 
-    let w = Weights::open(&model)?;
     let t0 = Instant::now();
-    let plan = Builder::new(&w, cfg.clone()).build(padded.img.h, padded.img.w)?;
-    println!(
-        "plan: {} ops, {} buffers, arena {:.1} MiB, weights {:.1} MiB, built in {:.2}s",
-        plan.ops.len(),
-        plan.bufs.len(),
-        plan.arena_bytes() as f64 / 1048576.0,
-        plan.weight_bytes() as f64 / 1048576.0,
-        t0.elapsed().as_secs_f64()
-    );
+    let plan = Builder::new(&w, cfg).build(padded.img.h, padded.img.w)?;
+    if !quiet {
+        eprintln!(
+            "maxim: plan {} ops, {} buffers, arena {:.1} MiB, weights {:.1} MiB, built in {:.2}s",
+            plan.ops.len(),
+            plan.bufs.len(),
+            plan.arena_bytes() as f64 / 1048576.0,
+            plan.weight_bytes() as f64 / 1048576.0,
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
-    let mut host = Host::new(plan);
+    // The full host arena is only needed where the host actually holds the
+    // activations: the CPU backend, the per-op verify walk, and a dump (which
+    // reads named activations out of it). A plain GPU run reads exactly one thing
+    // from the host arena - the input image - and the device executes off its own
+    // copy, so allocating the other 942.7 MiB would be memory and page-fault time
+    // spent so that nothing can read it. Only a development build can reach the
+    // two paths that ask for the full length.
+    let want_full_arena = {
+        #[cfg(feature = "dev")]
+        {
+            verify_gpu || dump.is_some()
+        }
+        #[cfg(not(feature = "dev"))]
+        {
+            false
+        }
+    };
+    let host_arena_len = if device == "cpu" || want_full_arena {
+        plan.arena_len
+    } else {
+        plan.offs[plan.input] + plan.bufs[plan.input].len()
+    };
+    let mut host = Host::with_arena_len(plan, host_arena_len);
+    #[cfg(feature = "dev")]
     if std::env::var_os("MAXIM_TRACE").is_some() {
         // The weight blobs are the one thing the per-tensor diff cannot see:
         // printing the first blob's head is the quickest way to tell a bad
         // permutation from a bad index.
         for (i, w) in host.weights.iter().enumerate().take(2) {
             let head: Vec<f32> = w.iter().take(12).copied().collect();
-            println!("weight {i}: len {} head {head:?}", w.len());
+            eprintln!("weight {i}: len {} head {head:?}", w.len());
         }
         // The full dump order is the graph order of the `rec` calls, which is
         // what makes a "first failing tensor" meaningful: it is the earliest
         // point in the graph where the backends disagree.
         for (i, (n, id)) in host.plan.dumps.iter().enumerate() {
-            println!("dump {i} {n} -> id {id} shape {:?}", host.plan.bufs[*id]);
+            eprintln!("dump {i} {n} -> id {id} shape {:?}", host.plan.bufs[*id]);
         }
     }
     let input_data = host.plan.bufs[host.plan.input].len();
     assert_eq!(input_data, padded.img.data.len());
     host.input_mut().copy_from_slice(&padded.img.data);
 
+    #[cfg(feature = "dev")]
     if verify_gpu {
         return verify_gpu_ops(&mut host);
     }
 
     let t1 = Instant::now();
+    // The CPU backend's per-op census, filled in when `--profile` is on. Only a
+    // development build can turn the flag on, so the whole measuring loop is
+    // gone from a release binary rather than merely unreachable in it.
+    #[cfg(feature = "dev")]
+    let mut cpu_timeline: Option<(Vec<f32>, f32)> = None;
     match device {
-        "cpu" => {
-            let (plan, weights) = (&host.plan, &host.weights);
-            let arena = &mut host.arena;
-            maxim::exec_cpu::run(plan, weights, arena);
-        }
-        #[cfg(feature = "cuda")]
-        "gpu" => {
-            let mut gpu = maxim::exec_gpu::Gpu::new(&host.plan)?;
-            gpu.set_timeline(profile);
-            gpu.set_legacy_ops(legacy_ops);
-            let mut out = vec![0.0f32; host.plan.bufs[host.plan.output].len()];
-            let o = host.plan.offs[host.plan.input];
-            let n = host.plan.bufs[host.plan.input].len();
-            let img = host.arena[o..o + n].to_vec();
-            gpu.run(&host.plan, &host.weights, &img, &mut out)?;
-            println!(
-                "gpu: {} launches, arena {:.1} MiB, weights {:.1} MiB, pool {:.1} KiB",
-                gpu.ops_launched(),
-                gpu.arena_bytes() as f64 / 1048576.0,
-                gpu.weight_bytes() as f64 / 1048576.0,
-                gpu.pool_bytes() as f64 / 1024.0
-            );
-            if let Some(tl) = gpu.timeline() {
-                report_timeline(&host.plan, tl);
+        #[cfg(feature = "dev")]
+        "cpu" if profile => {
+            // Per-op HOST timing, the same census the GPU backend gets from
+            // CUDA events. `step` is the call the op-by-op verify walk already
+            // uses, so the profile runs the plan the way that path does instead
+            // of through a second implementation of the loop.
+            let n = host.plan.ops.len();
+            let mut ms = vec![0.0f32; n];
+            let t = Instant::now();
+            for i in 0..n {
+                let t0 = Instant::now();
+                maxim::exec_cpu::step(&host.plan, &host.weights, &mut host.arena, i);
+                ms[i] = t0.elapsed().as_secs_f32() * 1000.0;
             }
-            // Nothing downstream reads the arena unless it is being dumped or
-            // cropped, and on a profiled run the copy is the largest thing in
-            // the measurement - 942 MiB back over PCIe is ~0.4 s of the total.
-            if dump.is_some() || output.is_some() {
-                // The whole arena comes back, not just the output: the dump step
-                // and the output crop both read it out of `host.arena`, and a
-                // named activation is only meaningful if the buffer it lives in
-                // was written by THIS run.
-                let mut arena = vec![0.0f32; host.plan.arena_len];
-                gpu.read_arena(&mut arena)?;
-                host.arena = arena;
-            }
+            cpu_timeline = Some((ms, t.elapsed().as_secs_f32() * 1000.0));
         }
-        #[cfg(not(feature = "cuda"))]
-        "gpu" => return Err("this binary was built without the `cuda` feature; use --device cpu".into()),
-        other => return Err(format!("unknown device {other} (expected gpu or cpu)").into()),
+        "cpu" => maxim::exec_cpu::run(&host.plan, &host.weights, &mut host.arena),
+        _ => {}
     }
-    let secs = t1.elapsed().as_secs_f64();
-    println!("ran in {:.2}s ({:.3} s/op)", secs, secs / host.plan.ops.len() as f64);
 
-    if let Some(dir) = dump {
-        std::fs::create_dir_all(&dir)?;
+    // A CPU-only build has no GPU branch at all, so naming the GPU is answered
+    // with that fact rather than by running the CPU engine and reporting the
+    // performance of something the caller did not ask for. It also has no
+    // fallback to refuse, so it does not read `force_gpu`.
+    #[cfg(not(feature = "cuda"))]
+    let _ = force_gpu;
+    #[cfg(not(feature = "cuda"))]
+    if device == "gpu" {
+        return Err("this build has no cuda feature; use --device cpu".into());
+    }
+
+    let out_data: Vec<f32> = if device == "cpu" {
+        let (o, n) = (host.plan.offs[host.plan.output], host.plan.bufs[host.plan.output].len());
+        host.arena[o..o + n].to_vec()
+    } else {
+        let want_arena = {
+            #[cfg(feature = "dev")]
+            {
+                dump.is_some()
+            }
+            #[cfg(not(feature = "dev"))]
+            {
+                false
+            }
+        };
+        match run_gpu(&mut host, profile, quiet, want_arena) {
+            Ok(v) => v,
+            // NAMING THE GPU IS A REQUEST; NOT NAMING IT IS NOT. gpu is the
+            // default, so a machine with no driver must still work: the driver
+            // failing to come up is not an error unless the caller asked for the
+            // GPU by name.
+            Err(e) if force_gpu => return Err(e),
+            Err(e) => {
+                // NOT PROGRESS OUTPUT, SO `--quiet` DOES NOT SILENCE IT. Which
+                // backend ran is a property of the result, like a warning, and a
+                // caller that asked for quiet to keep its logs small still needs
+                // to know it got the CPU.
+                eprintln!("maxim: cuda: {e}");
+                eprintln!("maxim: falling back to the CPU backend (--gpu forces the GPU)");
+                maxim::exec_cpu::run(&host.plan, &host.weights, &mut host.arena);
+                let (o, n) =
+                    (host.plan.offs[host.plan.output], host.plan.bufs[host.plan.output].len());
+                host.arena[o..o + n].to_vec()
+            }
+        }
+    };
+
+    let secs = t1.elapsed().as_secs_f64();
+    if !quiet {
+        eprintln!("maxim: ran in {:.2}s ({:.3} s/op)", secs, secs / host.plan.ops.len() as f64);
+    }
+
+    #[cfg(feature = "dev")]
+    if let Some(dir) = &dump {
+        std::fs::create_dir_all(dir)?;
         let names: Vec<(String, usize)> = host.plan.dumps.clone();
         for (name, id) in names {
             let s = host.plan.bufs[id];
@@ -223,27 +375,153 @@ fn run(
             let path = format!("{dir}/{}.npy", name.replace('/', "_"));
             image::save_npy(&path, s.c, s.h, s.w, &data)?;
         }
-        println!("wrote {} activations to {dir}", host.plan.dumps.len());
+        eprintln!("maxim: wrote {} activations to {dir}", host.plan.dumps.len());
     }
 
-    if let Some(out) = output {
-        let o = host.plan.offs[host.plan.output];
-        let n = host.plan.bufs[host.plan.output].len();
-        let pred = image::Image {
-            c: 3,
-            h: padded.img.h,
-            w: padded.img.w,
-            data: host.arena[o..o + n].to_vec(),
-        };
-        let cropped = image::crop_out(&pred, &padded);
-        image::write_png(&out, &cropped)?;
-        println!("wrote {out}");
+    #[cfg(feature = "dev")]
+    if let Some((ms, total)) = &cpu_timeline {
+        report_cpu_timeline(&host.plan, ms, *total);
     }
 
-    if profile {
-        println!("ops: {}", host.plan.ops.len());
+    // The reference crops the padded prediction back to the original size; `-`
+    // or absent means stdout, so the result can be piped straight to a viewer.
+    let pred = image::Image { c: 3, h: padded.img.h, w: padded.img.w, data: out_data };
+    let cropped = image::crop_out(&pred, &padded);
+    match output {
+        None | Some("-") => {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            image::write_png_stream(&mut lock, &cropped, "stdout")?;
+            lock.flush().map_err(|e| format!("stdout: {e}"))?;
+        }
+        Some(p) => {
+            image::write_png(p, &cropped)?;
+            if !quiet {
+                eprintln!("maxim: wrote {p}");
+            }
+        }
     }
     Ok(())
+}
+
+/// Run the plan on the GPU and bring the result back.
+///
+/// `want_arena` is what `--dump` needs: the whole host arena, so that every
+/// named activation can be snapshotted. A plain run reads ONE small tensor
+/// instead - the output `-o` crops from - because how much comes back is not a
+/// small difference: the whole arena is 942.7 MiB at the eval size, about 0.4 s
+/// over this link, against 2.9 MiB for the output.
+#[cfg(feature = "cuda")]
+fn run_gpu(host: &mut Host, profile: bool, quiet: bool, want_arena: bool) -> Result<Vec<f32>, maxim::Error> {
+    let mut gpu = maxim::exec_gpu::Gpu::new(&host.plan)?;
+    if profile {
+        gpu.set_timeline(true);
+    }
+    if !quiet {
+        eprintln!("maxim: device {}", gpu.device_name());
+    }
+    let o = host.plan.offs[host.plan.input];
+    let n = host.plan.bufs[host.plan.input].len();
+    let img = host.arena[o..o + n].to_vec();
+    let mut out = vec![0.0f32; host.plan.bufs[host.plan.output].len()];
+    gpu.run(&host.plan, &host.weights, &img, &mut out)?;
+    if !quiet {
+        eprintln!(
+            "maxim: {} launches, arena {:.1} MiB, weights {:.1} MiB, pool {:.1} KiB",
+            gpu.ops_launched(),
+            gpu.arena_bytes() as f64 / 1048576.0,
+            gpu.weight_bytes() as f64 / 1048576.0,
+            gpu.pool_bytes() as f64 / 1024.0
+        );
+    }
+    #[cfg(feature = "dev")]
+    if let Some(tl) = gpu.timeline() {
+        report_timeline(&host.plan, tl);
+    }
+    if want_arena {
+        let mut arena = vec![0.0f32; host.plan.arena_len];
+        gpu.read_arena(&mut arena)?;
+        host.arena = arena;
+        let (o, n) = (host.plan.offs[host.plan.output], host.plan.bufs[host.plan.output].len());
+        Ok(host.arena[o..o + n].to_vec())
+    } else {
+        gpu.read_into(host.plan.offs[host.plan.output], &mut out)?;
+        Ok(out)
+    }
+}
+
+/// A CPU-only build reaches this only if the caller named the GPU, which `run`
+/// answers before it gets here.
+#[cfg(not(feature = "cuda"))]
+fn run_gpu(_host: &mut Host, _profile: bool, _quiet: bool, _want_arena: bool) -> Result<Vec<f32>, maxim::Error> {
+    Err("this build has no cuda feature; use --device cpu".into())
+}
+
+/// Where the CPU time went, in the same shape as the GPU report.
+///
+/// The GPU's numbers come from a CUDA event around each op; these come from
+/// `Instant::now()` around the same op index, so they are HOST time and include
+/// whatever the pool costs to wake. The two reports are deliberately the same
+/// table, in the same order, computed by the same grouping, so a family that is
+/// expensive on one backend and cheap on the other is visible as a row that
+/// moved rather than as a number someone has to remember.
+///
+/// `per_op_ms` is the only difference from the GPU form - there is no launch
+/// count to report, because a CPU op IS one call - and the table omits that
+/// column rather than printing a column of ones.
+#[cfg(feature = "dev")]
+fn report_cpu_timeline(plan: &maxim::model::Plan, per_op_ms: &[f32], total_ms: f32) {
+    use std::collections::HashMap;
+    let mut by_kind: HashMap<String, (f32, usize)> = HashMap::new();
+    for (i, op) in plan.ops.iter().enumerate() {
+        // Same rule as the GPU report: `describe`'s first word is the family.
+        let d = maxim::exec_cpu::describe(op);
+        let kind = d.split_whitespace().next().unwrap_or("?").to_string();
+        let e = by_kind.entry(kind).or_insert((0.0, 0));
+        e.0 += per_op_ms[i];
+        e.1 += 1;
+    }
+    let mut rows: Vec<_> = by_kind.into_iter().collect();
+    rows.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    println!("timeline: {:.2}s total, {} ops, cpu", total_ms / 1000.0, per_op_ms.len());
+    println!("{:<10} {:>7} {:>9} {:>10}  {}", "op", "count", "total ms", "ms/op", "share");
+    for (kind, (ms, count)) in rows {
+        println!(
+            "{:<10} {:>7} {:>9.1} {:>10.3}  {:>5.1}%",
+            kind,
+            count,
+            ms,
+            ms / count as f32,
+            100.0 * ms / total_ms.max(1e-6)
+        );
+    }
+    let mut by_shape: HashMap<String, (f32, usize)> = HashMap::new();
+    for (i, op) in plan.ops.iter().enumerate() {
+        let e = by_shape.entry(maxim::exec_cpu::describe(op)).or_insert((0.0, 0));
+        e.0 += per_op_ms[i];
+        e.1 += 1;
+    }
+    let mut rows2: Vec<_> = by_shape.into_iter().collect();
+    rows2.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    println!("by shape (kind, then the shape or flags it describes):");
+    let mut printed = std::collections::HashSet::new();
+    for (k, (ms, n)) in rows2.iter().take(12) {
+        println!("  {ms:9.1} ms {n:5}x  {k}");
+        printed.insert(k.clone());
+    }
+    println!("  -- every other shape with 16 or more ops (aggregate, per-op):");
+    let mut many: Vec<_> = rows2.iter().filter(|(k, (_, n))| *n >= 16 && !printed.contains(k.as_str())).collect();
+    many.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    for (k, (ms, n)) in many {
+        println!("  {ms:9.1} ms {n:5}x  {k}   ({:.3} ms/op)", ms / *n as f32);
+    }
+    let mut worst: Vec<(usize, f32)> = per_op_ms.iter().copied().enumerate().collect();
+    worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    println!("slowest ops:");
+    for (i, ms) in worst.into_iter().take(5) {
+        println!("  op {i} {:.2} ms  {}", ms, maxim::exec_cpu::describe(&plan.ops[i]));
+    }
 }
 
 /// Where the GPU time went, grouped by op kind.
@@ -252,7 +530,7 @@ fn run(
 /// time and they sum to the run. What matters is the SHARE: the graph is 1840
 /// ops, and one kernel family holding a third of the time is a different problem
 /// from every op costing the same, which is what the total alone cannot say.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "dev", feature = "cuda"))]
 fn report_timeline(plan: &maxim::model::Plan, tl: &maxim::exec_gpu::Timeline) {
     use std::collections::HashMap;
     let mut by_kind: HashMap<String, (f32, usize, usize)> = HashMap::new();
@@ -288,6 +566,35 @@ fn report_timeline(plan: &maxim::model::Plan, tl: &maxim::exec_gpu::Timeline) {
             100.0 * ms / tl.total_ms.max(1e-6)
         );
     }
+    // A census by op kind and shape: the aggregate share says WHICH family is
+    // expensive, and this says which shapes inside it, which is what a kernel
+    // decision turns on (a 64-wide tile versus a fallback, a 128-channel layer
+    // versus a 32-channel one).
+    let mut by_shape: std::collections::HashMap<String, (f32, usize)> = std::collections::HashMap::new();
+    for (i, op) in plan.ops.iter().enumerate() {
+        let e = by_shape.entry(maxim::exec_cpu::describe(op)).or_insert((0.0, 0));
+        e.0 += tl.per_op_ms[i];
+        e.1 += 1;
+    }
+    let mut rows2: Vec<_> = by_shape.into_iter().collect();
+    rows2.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    // Print the 12 most expensive shapes AND every shape with enough ops that a
+    // per-op launch cost could dominate it. The second half is the point: a shape
+    // at 0.2 ms/op looks free next to a 4 ms conv, but 224 of them are 45 ms of
+    // the run, and the top-12 cut alone hides them (this is how the 120 `copy`
+    // ops, which dispatch NO kernel at all, stayed invisible for a whole session).
+    println!("by shape (kind, then the shape or flags it describes):");
+    let mut printed = std::collections::HashSet::new();
+    for (k, (ms, n)) in rows2.iter().take(12) {
+        println!("  {ms:9.1} ms {n:5}x  {k}");
+        printed.insert(k.clone());
+    }
+    println!("  -- every other shape with 16 or more ops (aggregate, per-op):");
+    let mut many: Vec<_> = rows2.iter().filter(|(k, (_, n))| *n >= 16 && !printed.contains(k.as_str())).collect();
+    many.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap_or(std::cmp::Ordering::Equal));
+    for (k, (ms, n)) in many {
+        println!("  {ms:9.1} ms {n:5}x  {k}   ({:.3} ms/op)", ms / *n as f32);
+    }
     let mut worst: Vec<(usize, f32)> = tl.per_op_ms.iter().copied().enumerate().collect();
     worst.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     println!("slowest ops:");
@@ -302,13 +609,14 @@ fn report_timeline(plan: &maxim::model::Plan, tl: &maxim::exec_gpu::Timeline) {
 /// This exists because "the GPU plot looks wrong" is not a diagnostic. The two
 /// backends share the op list by construction, so the only place they can differ
 /// is a kernel or a launch - and comparing the destination of every op in graph
-/// order names the culprit op directly. The CPU side doubles as the reference:
-/// it is already known to match torch to ~1e-6 on every named tensor.
+/// order names the culprit op directly. The CPU backend's own reading of the
+/// graph is independently known to match torch to ~1e-6 on every named tensor,
+/// so the diff is against trustworthy numbers rather than against itself.
 ///
 /// Both arenas are stepped in LOCKSTEP from the same input, so op i sees the
 /// same preceding state on both sides; a mismatch therefore reports the op that
 /// produced it, not an accumulation.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "dev", feature = "cuda"))]
 fn verify_gpu_ops(host: &mut Host) -> Result<(), maxim::Error> {
     let plan = &host.plan;
     let o = plan.offs[plan.input];
@@ -369,7 +677,7 @@ fn verify_gpu_ops(host: &mut Host) -> Result<(), maxim::Error> {
     Ok(())
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(all(feature = "dev", not(feature = "cuda")))]
 fn verify_gpu_ops(_host: &mut Host) -> Result<(), maxim::Error> {
     Err("--verify-gpu needs the `cuda` feature".into())
 }

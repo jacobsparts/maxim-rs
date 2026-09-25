@@ -17,15 +17,28 @@ path = "src/main.rs"
 # nvcc (set NVCC=/path/to/nvcc if it is not on PATH).
 default = ["cuda"]
 cuda = []
+# DEVELOPMENT BUILDS ONLY. Adds `--dump` (write every named activation as .npy),
+# `--profile` (the per-op CPU/GPU census), `--verify-gpu` (run the plan one op at
+# a time on both backends and report the first disagreement), `--factor` (the
+# pad multiple) and the MAXIM_* environment hooks. None of them is any use to
+# someone who wants a restored PNG, so a release binary neither accepts them nor
+# lists them, and refuses them BY NAME rather than ignoring them - a script that
+# asked for a dump must not carry on as if it had one. See docs/DEVELOPING.md.
+#     cargo build --release --features dev
+dev = []
 
 [dependencies]
 png = "0.17"
 # Driver layer, module/launch/buffer plumbing and the generic kernel set.
-# `libc` and `rayon` are deliberately NOT here: the toolkit owns the dlopen
-# driver layer and the mmapping, and the CPU executor is serial (one op at a
-# time, in graph order) because it doubles as the reference the GPU backend is
-# diffed against. Neither crate was referenced by any source file.
 lightgpu = { git = "https://github.com/jacobsparts/lightgpu.git" }
+# The CPU executor's pool: it runs one op at a time in graph order, as it always
+# has, but splits each op's own channels across this. `libc` is deliberately NOT
+# here - the toolkit owns the dlopen driver layer and the mmapping - and the GPU
+# executor needs no pool at all: it is device-bound, measured on a GTX 1080 at
+# 95-100% utilisation with the entire host side (1840 op dispatches and every
+# first-use weight upload) costing 2.5% of a 3.3 s run, and two streams of the
+# same conv3x3 measured at 0.99x, so there is no host work to overlap.
+rayon = "1.12"
 
 [build-dependencies]
 # Compiles this engine's kernel family and the toolkit subset it calls.

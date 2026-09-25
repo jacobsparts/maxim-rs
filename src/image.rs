@@ -32,10 +32,16 @@ impl Image {
 /// expanded to RGB, matching `Image.convert('RGB')`.
 pub fn read_png(path: &str) -> Result<Image, Error> {
     let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    let decoder = png::Decoder::new(std::io::BufReader::new(file));
-    let mut reader = decoder.read_info().map_err(|e| format!("{path}: {e}"))?;
+    read_png_stream(std::io::BufReader::new(file), path)
+}
+
+/// The same, from any reader - which is what `-i -` needs, and what makes the
+/// pipeline usable in a shell without a temporary file.
+pub fn read_png_stream<R: std::io::Read>(src: R, what: &str) -> Result<Image, Error> {
+    let decoder = png::Decoder::new(src);
+    let mut reader = decoder.read_info().map_err(|e| format!("{what}: {e}"))?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).map_err(|e| format!("{path}: {e}"))?;
+    let info = reader.next_frame(&mut buf).map_err(|e| format!("{what}: {e}"))?;
     let (w, h) = (info.width as usize, info.height as usize);
     let mut img = Image::new(3, h, w);
     let channels = match info.color_type {
@@ -44,7 +50,7 @@ pub fn read_png(path: &str) -> Result<Image, Error> {
         png::ColorType::Grayscale => 1,
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Indexed => {
-            return Err(format!("{path}: indexed PNG; re-save it as RGB").into())
+            return Err(format!("{what}: indexed PNG; re-save it as RGB").into())
         }
     };
     for y in 0..h {
@@ -67,10 +73,15 @@ pub fn read_png(path: &str) -> Result<Image, Error> {
 /// `(x * 255 + 0.5).astype(uint8)` does in the reference.
 pub fn write_png(path: &str, img: &Image) -> Result<(), Error> {
     let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), img.w as u32, img.h as u32);
+    write_png_stream(std::io::BufWriter::new(file), img, path)
+}
+
+/// The same, to any writer - `-o -` writes the PNG to stdout.
+pub fn write_png_stream<W: std::io::Write>(dst: W, img: &Image, what: &str) -> Result<(), Error> {
+    let mut encoder = png::Encoder::new(dst, img.w as u32, img.h as u32);
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(|e| format!("{path}: {e}"))?;
+    let mut writer = encoder.write_header().map_err(|e| format!("{what}: {e}"))?;
     let mut out = vec![0u8; 3 * img.h * img.w];
     for y in 0..img.h {
         for x in 0..img.w {
@@ -80,7 +91,7 @@ pub fn write_png(path: &str, img: &Image) -> Result<(), Error> {
             }
         }
     }
-    writer.write_image_data(&out).map_err(|e| format!("{path}: {e}"))?;
+    writer.write_image_data(&out).map_err(|e| format!("{what}: {e}"))?;
     Ok(())
 }
 

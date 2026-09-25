@@ -7,7 +7,15 @@ reads; the engine's weight loader is what knows a `kernel` under a
 `ConvTranspose_0` is stored [kh, kw, c_in, c_out] and must be flipped, rather
 than baking a transformation in here where it cannot be seen.
 
-    python3 tools/convert.py --npz ../models/checkpoint.npz --out ../models/maxim-lol.safetensors
+The header's `__metadata__` records what the engine could otherwise only guess:
+the task the checkpoint was trained for and the variant. The engine does NOT
+depend on it - it derives the architecture from the weights themselves, because
+a file converted before this existed must still load - but a self-describing
+checkpoint is what `realesrgan-rs` and `nafnet-rs` publish, and it is what tells
+a human which of the six published models they are holding.
+
+    python3 tools/convert.py --npz ../models/checkpoint.npz --task enhancement \
+        --out ../models/maxim-lol.safetensors
 """
 
 import argparse
@@ -25,7 +33,26 @@ DTYPES = {
 }
 
 
-def convert(npz_path, out_path):
+def variant_of(tensors):
+    """The published variant these weights are.
+
+    Feature width is the last dimension of the first encoder conv; the stage
+    count is how many `stage_N_*` groups the checkpoint has. Both are facts about
+    the bytes, so writing them down cannot make the file wrong - which is also
+    why the engine derives them itself rather than trusting this string.
+    """
+    by_name = dict(tensors)
+    features = by_name["stage_0_encoder_block_0/Conv_0/kernel"].shape[-1]
+    stages = 1
+    for n in range(1, 8):
+        if any(k.startswith("stage_%d_" % n) for k in by_name):
+            stages = n + 1
+    if features not in (32, 64) or not 1 <= stages <= 3:
+        return "unknown"
+    return "%s-%d" % ("S" if features == 32 else "M", stages)
+
+
+def convert(npz_path, out_path, task="enhancement"):
     with np.load(npz_path, allow_pickle=False) as z:
         keys = sorted(k[len("opt/target/"):] for k in z.keys() if k.startswith("opt/target/"))
         if not keys:
@@ -42,6 +69,13 @@ def convert(npz_path, out_path):
             total += a.nbytes
 
     header = {}
+    header["__metadata__"] = {
+        "format": "maxim",
+        "task": task,
+        "variant": variant_of(tensors),
+        "tensor_count": str(len(tensors)),
+        "source": "MAXIM Flax checkpoint, opt/target/* leaves, numpy " + np.__version__,
+    }
     offset = 0
     with open(out_path, "wb") as f:
         f.write(b"\0" * 8)                       # placeholder for the header length
@@ -68,8 +102,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--task",
+        default="enhancement",
+        help="the dataset the checkpoint was trained on, recorded in the header",
+    )
     args = ap.parse_args()
-    convert(args.npz, args.out)
+    convert(args.npz, args.out, args.task)
 
 
 if __name__ == "__main__":
