@@ -48,7 +48,7 @@ which is how the arena zeroing that used to cost 0.4 s was proved unnecessary),
 ## Checking a change
 
 The engine's output is compared against goldens it did not produce, and the
-hashes are the check: run the three size below and compare against these strings.
+hashes are the check: run the sizes below and compare against these strings.
 A change to a CPU kernel that moves them is wrong even if the picture looks right.
 
 | input | golden MD5 of the CPU output |
