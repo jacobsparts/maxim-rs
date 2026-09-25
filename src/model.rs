@@ -89,7 +89,12 @@ pub enum Op {
     /// built for the CPU does not add the blob at all. Both indices are operands
     /// in the plan-weight sense, never arena buffers - see `Op::operands`.
     Conv1x1 { dst: usize, src: usize, w: usize, wt: Option<usize>, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
-    Conv3x3 { dst: usize, src: usize, w: usize, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
+    /// `wt` is THE SAME WEIGHT as `w`, re-laid out as `[tap][ci][oc]` - the form
+    /// `mx_conv3x3_t4`/`_t2` read (see `weights::conv3x3_t`, and the kernel's own
+    /// comment for the 1.3-1.6x that layout is worth). Same rule as `Conv1x1::wt`:
+    /// the CPU executor reads `w` and ignores this, and a plan built for the CPU
+    /// does not add the blob at all.
+    Conv3x3 { dst: usize, src: usize, w: usize, wt: Option<usize>, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
     Conv4x4s2 { dst: usize, src: usize, w: usize, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize, pad_top: usize, pad_left: usize, oh: usize, ow: usize },
     ConvT2x2 { dst: usize, src: usize, w: usize, bias: Option<usize>, c_in: usize, c_out: usize, h: usize, wd: usize },
     /// A Dense over the CONTIGUOUS axis of a `[c][outer][inner]` tensor, the
@@ -266,7 +271,8 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// A gating Dense weight as `[c_out][c_in]`, the layout `mx_gate_mm` walks.
+    /// A gating Dense weight as `[c_out][c_in]`, the layout the gating matmul
+    /// walks.
     fn dense(&mut self, name: &str) -> Result<usize, Error> {
         let v = self.w.dense(name)?;
         Ok(self.weight(v))
@@ -309,12 +315,19 @@ impl<'a> Builder<'a> {
     fn conv3x3(&mut self, dst: usize, src: usize, prefix: &str, c_in: usize, c_out: usize, h: usize, wd: usize) -> Result<(), Error> {
         let k = self.w.convkxk(&format!("{prefix}/kernel"))?;
         let w = self.weight(k);
+        // The `[tap][ci][oc]` twin the GPU's tiled kernels read, under the same
+        // rule as the 1x1 twin above: the CPU path never looks at it.
+        let wt = if cfg!(feature = "cuda") {
+            Some(self.weight(self.w.conv3x3_t(&format!("{prefix}/kernel"))?))
+        } else {
+            None
+        };
         let bias = if self.w.has(&format!("{prefix}/bias")) {
             Some(self.own(&format!("{prefix}/bias"))?)
         } else {
             None
         };
-        self.ops.push(Op::Conv3x3 { dst, src, w, bias, c_in, c_out, h, wd });
+        self.ops.push(Op::Conv3x3 { dst, src, w, wt, bias, c_in, c_out, h, wd });
         Ok(())
     }
 
@@ -489,7 +502,7 @@ impl<'a> Builder<'a> {
     /// size and mixes over the grid axis, the block gMLP blocks it at the block
     /// size and mixes over the within-block axis. Both use `Op::BlockPerm` with
     /// the patch axis contiguous, so the difference is only which axis the Dense
-    /// reduces - and that is `mx_gate_mm`'s `mode`.
+    /// reduces - and that is the gating matmul's `mode`.
     fn gmlp_axis(
         &mut self,
         prefix: &str,
@@ -1196,6 +1209,7 @@ impl<'a> Builder<'a> {
             dumps: self.named,
             shape,
             labels: self.labels,
+            alias: self.alias,
         }
     }
 }
@@ -1214,9 +1228,16 @@ pub struct Plan {
     /// The padded input shape the plan was built for.
     pub shape: BufShape,
     /// A human-readable label per buffer, from the builder that made it. Only
-    /// used by the debug trace and the error messages: the shippable engine never
-    /// reads it, and a shape bug is otherwise very hard to localise.
+    /// used by the debug trace and the error messages: a shape bug is otherwise
+    /// very hard to localise.
     pub labels: Vec<String>,
+    /// Views: `Some((parent, element delta))` when a buffer is a channel range of
+    /// another's storage, `None` when it owns its bytes. `offs` has already
+    /// resolved these, so nothing needs it to RUN the plan - it is kept because
+    /// `live_ranges` needs the ownership structure to answer "which part of this
+    /// allocation is written before anything reads it", which is what lets
+    /// `exec_gpu::begin` zero a fraction of the arena instead of all of it.
+    pub alias: Vec<Option<(usize, usize)>>,
 }
 
 impl Plan {
@@ -1228,20 +1249,4 @@ impl Plan {
         self.weights.iter().map(|w| w.len() * 4).sum()
     }
 
-    pub fn shape_of(&self, id: usize) -> BufShape {
-        self.bufs[id]
-    }
-
-    /// The largest single allocation, the number that decides whether a device
-    /// can run a given input size.
-    pub fn peak_bytes(&self) -> usize {
-        let mut used = vec![0i64; self.arena_len + 1];
-        for (i, b) in self.bufs.iter().enumerate() {
-            used[self.offs[i]] += b.len() as i64;
-        }
-        // the arena is packed, so the high-water mark is the arena size; what
-        // matters for a device is whether the whole thing fits.
-        let _ = used;
-        self.arena_bytes()
-    }
 }

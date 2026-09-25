@@ -28,8 +28,37 @@ pub struct Host {
 }
 
 impl Host {
+    /// The full host arena - what the CPU backend and the dump/verify paths need.
     pub fn new(plan: Plan) -> Host {
         let arena = vec![0.0f32; plan.arena_len];
+        let weights = plan.weights.clone();
+        Host { plan, arena, weights, ops_run: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
+    }
+
+    /// A host whose arena is sized to what the caller will actually use it for.
+    ///
+    /// `new` allocates `plan.arena_len` elements - 942.7 MiB at the eval size - and
+    /// a GPU run never reads an activation out of the host arena: `main` copies the
+    /// input image in and, unless the run dumps or crops, never looks at it again.
+    /// The device executes off its own copy of whatever `begin` uploaded.
+    ///
+    /// So the caller says how much host arena it wants. `arena_len` is the real
+    /// length for the CPU backend, `--dump` and `--verify-gpu`; for a plain GPU run
+    /// it is enough to hold the input buffer. Passing the full length is always
+    /// correct, so this cannot silently break a caller that forgets to think about
+    /// it - it would just cost the allocation. The arena is still ZEROED either
+    /// way, so no reading path can see uninitialized memory: the saving is the
+    /// 942.7 MiB of untouched pages, not a relaxation of the initialization.
+    pub fn with_arena_len(plan: Plan, arena_len: usize) -> Host {
+        // The input buffer is the ONLY part of the arena a GPU run touches, and it
+        // lives at `offs[input]`, so that offset plus its length is the real floor
+        // - not the buffer's length alone, which would shift the image.
+        let need = plan.offs[plan.input] + plan.bufs[plan.input].len();
+        assert!(
+            arena_len >= need,
+            "host arena of {arena_len} elements cannot hold the input buffer, which ends at {need}"
+        );
+        let arena = vec![0.0f32; arena_len];
         let weights = plan.weights.clone();
         Host { plan, arena, weights, ops_run: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
     }
@@ -58,8 +87,4 @@ impl Host {
         self.arena[o..o + n].to_vec()
     }
 
-    /// Total bytes of device memory the GPU backend will need.
-    pub fn device_bytes(&self) -> usize {
-        self.plan.arena_bytes() + self.plan.weight_bytes()
-    }
 }

@@ -16,13 +16,29 @@ use lightgpu::safetensors;
 
 pub struct Weights {
     pub file: safetensors::File,
+    /// The architecture the checkpoint was trained with, read from the file
+    /// itself.
+    pub config: crate::config::Config,
 }
 
 impl Weights {
+    /// Open a converted checkpoint.
+    ///
+    /// THE ARCHITECTURE IS A PROPERTY OF THE FILE, NOT A FLAG. MAXIM ships six
+    /// variants that differ only in feature width and stage count, and the
+    /// weights themselves say which one they are - a `stage_2_*` name exists
+    /// only in the three-stage models. So the variant is DERIVED here, and there
+    /// is no way to ask for one that does not match the file: passing the wrong
+    /// variant by hand would build a graph that reads parameters the checkpoint
+    /// does not have, which fails deep inside the builder instead of at the
+    /// door. `tools/convert.py` records the variant in `__metadata__` so the
+    /// answer is stated rather than inferred where it can be, and the naming
+    /// below is the fallback for a file converted before that existed.
     pub fn open(path: &str) -> Result<Weights, Error> {
-        Ok(Weights { file: safetensors::File::open(path).map_err(Error)? })
+        let file = safetensors::File::open(path).map_err(Error)?;
+        let config = crate::config::Config::of_checkpoint(&file)?;
+        Ok(Weights { file, config })
     }
-
     pub fn shape(&self, name: &str) -> Result<&[usize], Error> {
         self.file.shape(name).map_err(Error)
     }
@@ -109,6 +125,41 @@ impl Weights {
                     for x in 0..kw {
                         out[((oc * cin + ic) * kh + y) * kw + x] =
                             k[((y * kw + x) * cin + ic) * cout + oc];
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The same k x k conv weight as `[k*k][c_in][c_out]` - the `[tap][ci][oc]`
+    /// layout this engine's `mx_conv3x3_t*` read.
+    ///
+    /// Why a second layout exists at all: with the toolkit's `[c_out][c_in][k][k]`
+    /// the four weights a thread needs for its four output channels are 512 floats
+    /// apart, so the inner loop of the tiled conv spends four SHARED-MEMORY loads
+    /// on them per three multiply-accumulates. Here they are contiguous, so those
+    /// four become one 128-bit load. Measured against a host reference, with the
+    /// output identical to the element to the old kernel's: 2.245 -> 1.708 ms at
+    /// 64->64 @224x320 and 2.616 -> 2.026 at 128->128 @112x160 (the 16x16 form),
+    /// 3.406 -> 2.174 at 32->32 @448x640 (the 32x8 form, whose weight loads the
+    /// old layout strided further apart still).
+    ///
+    /// Flax stores `[kh][kw][c_in][c_out]`, so this is not a permutation of the
+    /// blob `convkxk` builds but a different walk of the checkpoint's own order.
+    pub fn conv3x3_t(&self, name: &str) -> Result<Vec<f32>, Error> {
+        let k = self.vec(name)?;
+        let s = self.shape(name)?;
+        if s.len() != 4 {
+            return Err(format!("{name}: expected a 4-D conv kernel, got {s:?}").into());
+        }
+        let (kh, kw, cin, cout) = (s[0], s[1], s[2], s[3]);
+        let mut out = vec![0.0f32; k.len()];
+        for y in 0..kh {
+            for x in 0..kw {
+                for ic in 0..cin {
+                    for oc in 0..cout {
+                        out[((y * kw + x) * cin + ic) * cout + oc] = k[((y * kw + x) * cin + ic) * cout + oc];
                     }
                 }
             }

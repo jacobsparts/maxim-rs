@@ -1,7 +1,7 @@
 //! Compiles this engine's kernels into two modules: the shared `lightgpu`
 //! toolkit's `cuda/kernels.cu` (TOOLKIT_KERNELS) and this project's own
 //! `cuda/maxim.cu` (PROJECT_KERNELS). Each compiles to its own fatbin with its
-//! own `--entries` list and `src/gpu.rs` loads them as separate modules, so
+//! own `--entries` list and `src/cuda.rs` loads them as separate modules, so
 //! neither can shadow a name in the other.
 //!
 //! A kernel missing from its list is PRUNED from the fatbin and fails at launch
@@ -15,44 +15,59 @@
 /// copy is a device-to-device memcpy, which is faster than launching for it).
 const TOOLKIT_KERNELS: &[&str] = &[
     "lg_add",
+    // An elementwise product. This engine shipped its own (`mx_mul`) until the
+    // toolkit took one: NAFNet's SimpleGate and the other gated architectures
+    // need a plain multiply too, so it is generic rather than MAXIM-specific.
+    "lg_mul",
     "lg_gelu_erf",
     "lg_lrelu",
+    // The CALayer is three toolkit ops: excite (a sigmoid), the global average
+    // pool, and the per-channel scale. All three were this engine's own kernels
+    // until they were recognised as generic; the toolkit's `lg_channel_scale` is
+    // its `lg_channel_affine` with no shift, and `lg_sigmoid` differs from the
+    // deleted `mx_sigmoid` only in using `__expf` where this file used `expf`.
+    "lg_sigmoid",
+    "lg_channel_mean",
+    "lg_channel_scale",
     // The channel-axis LayerNorm. MAXIM needs it in two places that look
     // different and are the same op: an NCHW (c, h*w) tensor, and a gMLP tensor
     // in the blocked layout (c, grid*patch) whose channel axis is contiguous.
     "lg_channel_layer_norm",
-    // 1x1 conv. NO LONGER LAUNCHED: it is the model's biggest op family, and its
-    // one-thread-per-output form re-reads the input `c_in` times (see
-    // `mx_conv1x1_t`). It stays in the list because leaving a kernel out of
-    // `--entries` prunes it from the fatbin and a stale caller would then fail at
-    // LAUNCH - the compile-time completeness check at the bottom of this file is
-    // what keeps the two in step, and it cannot tell a call site from a
-    // declaration.
-    "lg_conv1x1",
-    // 3x3 pad-1 conv, the SAM block and the stage input convs. The Winograd
-    // variant is *not* used: at c_in=3 the transform does not amortise, and the
-    // rest of the 3x3s are few enough that the direct form is simpler to trust.
-    "lg_conv3x3s1p1",
+    // `lg_conv3x3s1p1` USED TO BE HERE and is deliberately gone. It was embedded
+    // as the fallback for "a width the tiled kernel cannot tile", but no such
+    // width exists: `c3_body` derives `ow` from `x0` in-kernel, so a row whose
+    // width is not a multiple of 64 costs one short segment rather than the whole
+    // row, and `--factor` only changes the segment count. Nothing in this engine
+    // ever named it, so it was embedded bytes that no op could launch.
+    //
+    // Its numbers, which is the reason the entry is worth this note: one thread
+    // per output element, 9*c_in input loads and 9*c_in weight loads per output
+    // (~1 MAC per 8 bytes moved), 1.07-1.27 TFLOP/s at c_in=128 against this
+    // card's 8.2, and 1.90 s of a 4.32 s 512x512 run in the profile that
+    // motivated the tiled form. The Winograd variant was never used either: at
+    // c_in=3 the transform does not amortise.
 ];
 
 /// This project's own kernels, in `cuda/maxim.cu`.
 const PROJECT_KERNELS: &[&str] = &[
     "mx_conv1x1_t",
+    "mx_conv1x1_t4",
+    "mx_conv1x1_t8",
     "mx_conv3x3_t2",
     "mx_conv3x3_t4",
+    "mx_conv3x3_w4",
     "mx_conv4x4s2",
     "mx_convt2x2s2",
-    "mx_gate_mm",
     "mx_gate_mm_t0",
     "mx_gate_mm_t1",
     "mx_gate_apply",
-    "mx_mul",
+    "mx_chan_ln",
+    "mx_chan_ln_c32",
+    "mx_chan_ln_c64",
+    "mx_chan_ln_c128",
     "mx_resize_axis",
     "mx_block_perm",
-    "mx_channel_mean",
-    "mx_channel_scale",
     "mx_down2",
-    "mx_sigmoid",
 ];
 
 fn main() {

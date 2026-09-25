@@ -27,30 +27,37 @@ pub const TOOLKIT_FATBIN: &[u8] = include_bytes!(env!("LIGHTGPU_FATBIN_MAXIM_TOO
 /// The names in each module, for the startup completeness check.
 pub const PROJECT_KERNELS: &[&str] = &[
     "mx_conv1x1_t",
+    "mx_conv1x1_t4",
+    "mx_conv1x1_t8",
     "mx_conv3x3_t2",
     "mx_conv3x3_t4",
+    "mx_conv3x3_w4",
     "mx_conv4x4s2",
     "mx_convt2x2s2",
-    "mx_gate_mm",
     "mx_gate_mm_t0",
     "mx_gate_mm_t1",
-    "mx_mul",
     "mx_gate_apply",
+    "mx_chan_ln",
+    "mx_chan_ln_c32",
+    "mx_chan_ln_c64",
+    "mx_chan_ln_c128",
     "mx_resize_axis",
     "mx_block_perm",
-    "mx_channel_mean",
-    "mx_channel_scale",
     "mx_down2",
-    "mx_sigmoid",
 ];
 
 pub const TOOLKIT_KERNELS: &[&str] = &[
     "lg_add",
-    "lg_conv1x1",
-    "lg_conv3x3s1p1",
-    "lg_channel_layer_norm",
+    "lg_mul",
     "lg_gelu_erf",
     "lg_lrelu",
+    "lg_sigmoid",
+    "lg_channel_mean",
+    "lg_channel_scale",
+    // No `lg_conv3x3s1p1`: this engine never launches it - see the note in
+    // `build.rs`. It is not in the fatbin either, so the startup check below
+    // would fail if some op ever named it again, which is the point.
+    "lg_channel_layer_norm",
 ];
 
 pub struct Cuda {
@@ -130,8 +137,6 @@ impl Buf {
 /// it, so a plan that resolves a parameter it never uses costs nothing.
 pub struct WeightCache {
     bufs: Vec<Option<Buf>>,
-    hits: usize,
-    uploads: usize,
     /// Total weight bytes the device has been asked for, whether or not it is
     /// resident: `resident_bytes` counts what a successful run left allocated,
     /// which is not what a run that ran out of memory needs to know.
@@ -140,7 +145,7 @@ pub struct WeightCache {
 
 impl WeightCache {
     pub fn new(n: usize) -> WeightCache {
-        WeightCache { bufs: (0..n).map(|_| None).collect(), hits: 0, uploads: 0, wanted_bytes: 0 }
+        WeightCache { bufs: (0..n).map(|_| None).collect(), wanted_bytes: 0 }
     }
 
     pub fn get(&mut self, id: usize, host: &[Vec<f32>]) -> Result<&Buf, Error> {
@@ -158,9 +163,6 @@ impl WeightCache {
             })?;
             b.upload(&host[id])?;
             self.bufs[id] = Some(b);
-            self.uploads += 1;
-        } else {
-            self.hits += 1;
         }
         Ok(self.bufs[id].as_ref().unwrap())
     }
@@ -169,9 +171,6 @@ impl WeightCache {
         self.bufs.iter().flatten().map(|b| b.n * 4).sum()
     }
 
-    pub fn stats(&self) -> (usize, usize) {
-        (self.uploads, self.hits)
-    }
 }
 
 /// Per-buffer shapes, looked up by the launchers that need them.
