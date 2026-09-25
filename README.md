@@ -23,7 +23,7 @@ maxim -m maxim-lol.safetensors -i dark.png -o bright.png
   hand-written kernels. The GPU is used when a CUDA driver is available and the
   CPU path otherwise, so one binary covers a machine with no NVIDIA driver at
   all; `--device cpu|gpu` overrides that choice.
-* 2.82 MiB binary, statically linked except `libc` and `libgcc_s`.
+* 2.82 MiB binary, statically linked except `libc`, `libm` and `libgcc_s`.
   `libcuda.so.1` is `dlopen`ed, so no driver is required on disk. (The CPU-only
   build is 1.24 MiB.)
 * The checkpoint is data, not code: `tools/convert.py` copies the weights out of
