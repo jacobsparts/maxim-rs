@@ -142,8 +142,8 @@ point, and the output is checked against the authors' own published results on
 whole official test sets - LOL (23.466 dB against their 23.4346), all 980
 RealBlur-R images (37.387 against 37.113) and all 500 RESIDE-Indoor images (37.929
 against 38.113). The engine lands within 0.02-0.04 dB of the official JAX
-implementation on all three; how that is measured, and why the published PNGs
-themselves score slightly differently, is in
+implementation on all three (worst 0.044 dB); how that is measured, and why the
+published PNGs themselves score slightly differently, is in
 [docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 ## Licence and attribution
