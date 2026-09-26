@@ -69,8 +69,16 @@ pub fn read_png_stream<R: std::io::Read>(src: R, what: &str) -> Result<Image, Er
     Ok(img)
 }
 
-/// Write `[3][h][w]` in 0..1 as an 8-bit PNG, rounding half up - what
-/// `(x * 255 + 0.5).astype(uint8)` does in the reference.
+/// Write `[3][h][w]` in 0..1 as an 8-bit PNG, rounding half up.
+///
+/// UPSTREAM TRUNCATES. `run_eval.py` and `predict.py` both save with
+/// `(np.clip(img, 0., 1.) * 255.).astype(jnp.uint8)`, which drops the fraction,
+/// and their published result PNGs show it: about half of the pixels come out
+/// one level below this engine's, and comparing the two pictures gives ~50 dB
+/// PSNR rather than an exact match. Rounding is what `tools/reference.py` does
+/// and what the engine has always done, so it stays: the difference is half an
+/// 8-bit level on average, it is invisible next to the model's own error, and
+/// changing it now would move every golden hash for no gain in accuracy.
 pub fn write_png(path: &str, img: &Image) -> Result<(), Error> {
     let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
     write_png_stream(std::io::BufWriter::new(file), img, path)

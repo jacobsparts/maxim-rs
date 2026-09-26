@@ -1,5 +1,37 @@
 """Convert MAXIM's Flax `.npz` checkpoint to a `safetensors` file.
 
+Upstream publishes one checkpoint per task and dataset, and which of the six
+variants each one is follows from the task alone, so they all convert with the
+same command - which is copied here rather than described, because it is also
+how the eleven attached to the release were produced and checked:
+
+    base=https://storage.googleapis.com/gresearch/maxim/ckpt
+    while read dir npz out task; do
+        curl -sS -o $npz.npz "$base/$dir/checkpoint.npz"
+        python3 tools/convert.py --npz $npz.npz --task $task --out $out
+    done <<'EOF'
+    Denoising/SIDD         denoising-sidd       maxim-sidd.safetensors         denoising
+    Deblurring/GoPro       deblurring-gopro     maxim-gopro.safetensors        deblurring
+    Deblurring/REDS        deblurring-reds      maxim-reds.safetensors         deblurring
+    Deblurring/RealBlur_R  deblurring-realblur-r maxim-realblur-r.safetensors  deblurring
+    Deblurring/RealBlur_J  deblurring-realblur-j maxim-realblur-j.safetensors  deblurring
+    Deraining/Rain13k      deraining-rain13k    maxim-rain13k.safetensors      deraining
+    Deraining/Raindrop     deraining-raindrop   maxim-raindrop.safetensors     deraining
+    Dehazing/SOTS-Indoor   dehazing-indoor      maxim-sots-indoor.safetensors  dehazing
+    Dehazing/SOTS-Outdoor  dehazing-outdoor     maxim-sots-outdoor.safetensors dehazing
+    Enhancement/LOL        enhancement-lol      maxim-lol.safetensors          enhancement
+    Enhancement/FiveK      enhancement-fivek    maxim-fivek.safetensors        enhancement
+    EOF
+
+The .npz names are the ones this loop downloads to, and the header records the
+basename, so re-running it from scratch reproduces the published files byte for
+byte. (The `numpy <version>` that used to be in that string did not: it was a
+fact about the machine, not about the model.)
+
+Denoising/ and Denoising/SIDD are the same weights, and GoPro serves HIDE and
+SIDD serves DND, so eleven files cover all fourteen published task rows. Each is
+54.1 MiB (S-2) or 84.7 MiB (S-3) once the optimizer state is dropped.
+
 Only the `opt/target/*` leaves are weights; the rest of the file is optimizer
 state (~75% of the bytes) and is dropped. The names keep their flax form
 (`stage_0_encoder_block_0/Conv_0/kernel`) because that is what the model code
@@ -20,6 +52,7 @@ a human which of the six published models they are holding.
 
 import argparse
 import json
+import os
 import sys
 
 import numpy as np
@@ -53,6 +86,7 @@ def variant_of(tensors):
 
 
 def convert(npz_path, out_path, task="enhancement"):
+    basename = os.path.basename(npz_path)
     with np.load(npz_path, allow_pickle=False) as z:
         keys = sorted(k[len("opt/target/"):] for k in z.keys() if k.startswith("opt/target/"))
         if not keys:
@@ -74,7 +108,12 @@ def convert(npz_path, out_path, task="enhancement"):
         "task": task,
         "variant": variant_of(tensors),
         "tensor_count": str(len(tensors)),
-        "source": "MAXIM Flax checkpoint, opt/target/* leaves, numpy " + np.__version__,
+        # The source file, as realesrgan-rs records it. Deliberately NOT the
+        # numpy version that happened to be installed, which was in this string
+        # before: a build string makes the same weights convert to a different
+        # file on another machine, and the point of this script is that the
+        # published checkpoints are reproduced by re-running it on the .npz.
+        "source": "MAXIM Flax checkpoint %s, opt/target/* leaves" % basename,
     }
     offset = 0
     with open(out_path, "wb") as f:
@@ -105,7 +144,9 @@ def main():
     ap.add_argument(
         "--task",
         default="enhancement",
-        help="the dataset the checkpoint was trained on, recorded in the header",
+        choices=["enhancement", "denoising", "deblurring", "deraining", "dehazing"],
+        help="the task the checkpoint was trained for, recorded in the header; "
+        "the engine does not read it",
     )
     args = ap.parse_args()
     convert(args.npz, args.out, args.task)

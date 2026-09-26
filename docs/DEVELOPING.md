@@ -125,6 +125,30 @@ figure for the checkpoint is 23.43. A difference in the mean points at an engine
 bug, while agreement with a mean that missed 23.43 would point at the checkpoint
 or the preprocessing instead. `tools/eval.py` returns non-zero on either.
 
+**Against the authors' own outputs**, which is the check neither of the two
+above is. Upstream publishes the PNGs their JAX implementation produced, next to
+a per-image PSNR table, so the engine can be compared with the thing it is a
+reimplementation of:
+
+| checkpoint | set | images | engine mean PSNR | their mean PSNR | engine vs their PNGs |
+| --- | --- | --- | --- | --- | --- |
+| LOL (S-2, enhancement) | eval15 | 15 | 23.466 | 23.4346 | 47.9-53.3 dB |
+| RESIDE-Indoor (S-2, dehazing) | demo inputs | 2 | - | 30.35, 38.24 | 50.7, 51.6 dB |
+| RealBlur-R (S-3, deblurring) | the whole test set | 980 | 35.85 | 35.72 | - |
+
+The engine's PNGs are never identical to theirs, and that is expected: both of
+their scripts write with `(np.clip(x, 0., 1.) * 255.).astype(uint8)`, which
+TRUNCATES, while this engine (and `reference.py`) round half up. Roughly half the
+pixels therefore differ by one 8-bit level, which is a ~50 dB comparison, and it
+is why the published table - not the published PNGs - is the yardstick. Rounding
+is kept: half a level on average is far below the model's own error, and moving
+to truncation would change every golden hash for no gain.
+
+The S-3 path is covered by the RealBlur-R row, which is also the largest check
+here: 980 images, all of them, against the authors' numbers for the same set. The
+five S-3 checkpoints (denoising and deblurring) share a graph, so that row is
+about the architecture rather than about one file.
+
 **Known infidelities**, all far below 8-bit output precision and deliberately not
 chased:
 
