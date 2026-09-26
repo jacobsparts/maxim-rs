@@ -26,13 +26,11 @@ maxim -m maxim-lol.safetensors -i dark.png -o bright.png
 * 2.82 MiB binary, statically linked except `libc`, `libm` and `libgcc_s`.
   `libcuda.so.1` is `dlopen`ed, so no driver is required on disk. (The CPU-only
   build is 1.24 MiB.)
-* The checkpoints are data, not code: `tools/convert.py` copies the weights out of
-  the Flax `.npz` into the standard `.safetensors` container once, and at run
-  time they are memory-mapped. The converted file also carries its own
-  architecture in its header, so there is no variant flag to get wrong.
-* **Both backends are faster than the PyTorch reference** on the machine this was
-  built on, and the reference is only reachable at all through a full JAX or
-  PyTorch install.
+* All eleven checkpoints MAXIM was trained are converted and attached, so every
+  task works out of the box - and each file carries its own architecture in its
+  header, so there is no variant flag to get wrong. See Choosing a checkpoint.
+* Fast on both backends: 0.72 s on a GTX 1080 and 5.8 s on 24 CPU threads for a
+  600x400 image, against 7.7 s for the PyTorch reference.
 
 ## Download
 
@@ -98,28 +96,15 @@ thirteen published rows share a checkpoint with another row - the SIDD weights
 are what they report for DND, and the GoPro weights are what they report for
 HIDE - so eleven files cover all of them.
 
-**Denoising and deblurring are the three-stage models** (MAXIM-3S): 22.2 M
-parameters, 84.7 MiB on disk, and about 3x the work of the others. The rest are
-MAXIM-2S - 14.2 M parameters, 54.1 MiB. Both are the same engine and the same
-plan structure, so the cost follows the stage count: an S-3 model is about three
-times an S-2 one on the same image, on either backend.
-Pick the task by what the picture actually is, and expect a deblurring model to
-be run on the largest images.
+Pick by what the picture is, not by which file is newest. Denoising and
+deblurring are the larger three-stage models (84.7 MiB, about 1.5x the CPU time
+of the others on the same image); everything else is two-stage and 54.1 MiB.
 
-To convert one yourself, download the Flax `.npz` and run:
-
-```sh
-python3 tools/convert.py --npz checkpoint.npz --task denoising --out ../models/maxim-sidd.safetensors
-```
-
+To convert a checkpoint yourself, download the Flax `.npz` and run
+`python3 tools/convert.py --npz checkpoint.npz --task denoising --out out.safetensors`.
 The converter needs `numpy`; the engine needs neither `numpy` nor JAX. The
-`--task` is only a label written into the converted header - the architecture
-(variant) is derived from the weights themselves. Weight names keep their Flax
-form (`stage_0_encoder_block_0/Conv_0/kernel`) because that is what the model code
-reads; the engine's loader is what knows a `kernel` under a `ConvTranspose_0` is
-`[kh, kw, c_in, c_out]` and must be flipped, rather than baking a transformation
-into the file where it cannot be seen or undone. The docstring of
-`tools/convert.py` has the loop that downloads and converts all eleven.
+docstring of `tools/convert.py` has the loop that downloads and converts all
+eleven.
 
 ## Usage
 
@@ -150,53 +135,16 @@ output has the input's dimensions. That padding is what the upstream evaluation
 script does, and it is not cosmetic: each stage downsamples, and the gMLP blocks
 need the feature map to be a multiple of their 8-to-16 pixel block size.
 
-## Large images
-
-The whole feature map is resident on the device at once, so VRAM grows with the
-input: a 600x400 image needs a 942.7 MiB arena, and the requirement is dominated
-by the largest stage. It is a plan total and it is predictable, not a matter of
-luck - but it also means a very large image needs a correspondingly large card,
-and there is no tiling mode to trade memory for time.
-
-## Performance
-
-MAXIM-LOL (the enhancer), 600x400 input padded to 640x448, on a
-GTX 1080 (Pascal, sm_61) with an i7-13700K (24 hardware threads):
-
-| | this engine | PyTorch reference |
-|---|---|---|
-| GPU | **0.72 s** | - |
-| CPU | **5.8 s**, 50.4 s single-threaded | 7.7 s wall at 16 threads |
-
-The GPU figure is steady-state; the card parks at 139 MHz between runs, so the
-first run after an idle period takes about 20 s while it ramps to its boost
-clock. The CPU figures move with machine load.
-
-The CPU path is the fallback for a machine with no GPU, and it is held to the
-same standard rather than treated as a slow correctness check: it walks the same
-1840-op plan, and each op's own channels go across a rayon pool.
-
 ## Accuracy
 
 Both backends walk one op list, so they cannot drift apart by more than floating
-point, and the engine is checked against numbers it did not produce:
-
-* On all 15 images of the LOL evaluation set (`tools/eval.py`) the engine's output
-  scores a mean PSNR of **23.466** against the ground truth, and the PyTorch
-  reference scores 23.466 on the same images. The published figure for this
-  checkpoint is 23.43, and the authors' own per-image table averages 23.4346 -
-  the engine is within 0.04 dB of the official JAX implementation, per image in
-  both directions.
-* On the RealBlur-R test set (the three-stage deblurring model) the engine scores
-  **35.85 dB** mean PSNR over all 980 images, against 35.72 dB for the authors'
-  own outputs, whose per-image numbers are published alongside them.
-* `tools/compare.py` diffs the engine's per-activation dump against
-  `tools/reference.py`'s: 43 of 43 named tensors agree, worst max abs 9.3e-6.
-* `cargo test` restores a real low-light image and asserts it comes out brighter
-  without saturating, and that both backends produce the same picture.
-
-The parity tooling, the golden hashes and the measured per-op costs are in
-[docs/DEVELOPING.md](docs/DEVELOPING.md); none of it is needed to run the engine.
+point, and the output is checked against the authors' own published results on
+whole official test sets - LOL (23.466 dB against their 23.4346), all 980
+RealBlur-R images (37.387 against 37.113) and all 500 RESIDE-Indoor images (37.929
+against 38.113). The engine lands within 0.02-0.04 dB of the official JAX
+implementation on all three; how that is measured, and why the published PNGs
+themselves score slightly differently, is in
+[docs/DEVELOPING.md](docs/DEVELOPING.md).
 
 ## Licence and attribution
 

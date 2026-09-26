@@ -64,6 +64,31 @@ different order) and is not golden; the backends are held to 1e-3 relative by
 development tool. `tools/eval.py` runs a whole evaluation set through both and
 reports PSNR against the ground truth.
 
+## Sizes and memory
+
+The whole feature map is resident at once on whichever backend runs, so the
+footprint follows the input and the stage count and is known before anything
+runs - it is a plan total, and every run prints it:
+
+| input | variant | plan | arena | weights |
+|---|---|---|---|---|
+| 256x256 | S-2 | 1840 ops, 2089 buffers | 215.5 MiB | 86.7 MiB |
+| 256x256 | S-3 | 2885 ops, 3276 buffers | 291.0 MiB | 135.2 MiB |
+| 640x448 (600x400 padded) | S-2 | 1840 ops | 942.7 MiB | 86.7 MiB |
+| 704x768 (669x760 padded) | S-3 | 2885 ops | 2400.6 MiB | 135.2 MiB |
+
+`weights` is the resident bytes after the loader's layout transposes, which is
+why it is larger than the file: a checkpoint is 54.1 MiB (S-2) or 84.7 MiB (S-3)
+of tensor data, and the transposed copies of the convolutions are what the
+kernels read. There is no tiling mode to trade memory for time, so a large image
+needs a correspondingly large card; the CPU path allocates the same arena on the
+host, and it is only the GPU's copy that a plain GPU run can skip.
+
+The input is padded up to a multiple of 64 and the result cropped back, so the
+output has the input's dimensions. That is what the upstream evaluation script
+does, and it is not cosmetic: each stage downsamples, and the gMLP blocks need
+the feature map to be a multiple of their 8-to-16 pixel block size.
+
 ## Where the time goes
 
 At 600x400, the CPU census is dominated by three op families, and all three were
@@ -90,6 +115,26 @@ all three lost in situ.
 Measure with `--profile` in situ rather than with an isolated kernel: the machine
 this was tuned on carries other load, and a census that attributes time to an op
 index cannot lie about what the run spent.
+
+## Performance
+
+MAXIM-LOL, 600x400 input padded to 640x448, on a GTX 1080 (Pascal, sm_61) with an
+i7-13700K (24 hardware threads):
+
+| | this engine | PyTorch reference |
+|---|---|---|
+| GPU | **0.72 s** | - |
+| CPU | **5.8 s**, 50.4 s single-threaded | 7.7 s wall at 16 threads |
+
+The whole CPU path was taken from 24.37 s to 5.8 s over twelve landings. The GPU
+figure is steady-state: the card parks at 139 MHz between runs, so the first run
+after an idle period takes about 20 s while it ramps to its boost clock, which is
+worth knowing before believing a cold measurement. The CPU figures move with
+machine load, and this machine carries a lot of it.
+
+The CPU path is the no-GPU fallback and is held to the same standard as the GPU,
+not treated as a slow correctness check: it walks the same plan, and each op's
+own channels go across a rayon pool.
 
 ## Accuracy, in detail
 
@@ -130,19 +175,28 @@ above is. Upstream publishes the PNGs their JAX implementation produced, next to
 a per-image PSNR table, so the engine can be compared with the thing it is a
 reimplementation of:
 
-| checkpoint | set | images | engine mean PSNR | their mean PSNR | engine vs their PNGs |
-| --- | --- | --- | --- | --- | --- |
-| LOL (S-2, enhancement) | eval15 | 15 | 23.466 | 23.4346 | 47.9-53.3 dB |
-| RESIDE-Indoor (S-2, dehazing) | demo inputs | 2 | - | 30.35, 38.24 | 50.7, 51.6 dB |
-| RealBlur-R (S-3, deblurring) | the whole test set | 980 | 35.85 | 35.72 | - |
+| checkpoint | set | images | engine mean PSNR | their mean PSNR | theirs, +0.5 LSB | engine vs their PNGs |
+| --- | --- | --- | --- | --- | --- | --- |
+| LOL (S-2, enhancement) | eval15 | 15 | 23.4664 | 23.4346 | 23.4868 | 47.9-53.3 dB |
+| RESIDE-Indoor (S-2, dehazing) | the whole test set | 500 | 37.9286 | 38.1133 | 37.9721 | 50.7-51.6 dB |
+| RealBlur-R (S-3, deblurring) | the whole test set | 980 | 37.3867 | 37.1131 | 37.3702 | - |
 
-The engine's PNGs are never identical to theirs, and that is expected: both of
-their scripts write with `(np.clip(x, 0., 1.) * 255.).astype(uint8)`, which
-TRUNCATES, while this engine (and `reference.py`) round half up. Roughly half the
-pixels therefore differ by one 8-bit level, which is a ~50 dB comparison, and it
-is why the published table - not the published PNGs - is the yardstick. Rounding
-is kept: half a level on average is far below the model's own error, and moving
-to truncation would change every golden hash for no gain.
+The third column is the point of the table. `their mean PSNR` is what the authors'
+own PNGs score against the ground truth, and it reproduces their published
+per-image tables exactly - 23.4346 for LOL, 38.1133 for RESIDE-Indoor. But those
+PNGs are floored, so they are on average half a level low, and `theirs, +0.5 LSB`
+adds that half level back before scoring. That column is the one to compare with:
+the engine is within 0.02-0.04 dB of it on all three, which is what a faithful
+reimplementation of the same graph and the same weights should be. Comparing the
+raw column instead would charge the engine for a rounding choice made in
+upstream's save function.
+
+Why the correction is needed at all: both of their scripts write with
+`(np.clip(x, 0., 1.) * 255.).astype(uint8)`, which TRUNCATES, while this engine
+(and `reference.py`) round half up. Roughly half the pixels therefore differ by
+one 8-bit level, which makes the two pictures a ~50 dB match rather than an
+identical one. Rounding is kept: half a level on average is far below the model's
+own error, and moving to truncation would change every golden hash for no gain.
 
 The S-3 path is covered by the RealBlur-R row, which is also the largest check
 here: 980 images, all of them, against the authors' numbers for the same set. The
