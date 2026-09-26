@@ -31,6 +31,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// silently doing nothing.
 static SERIAL: AtomicBool = AtomicBool::new(false);
 
+/// The pixels a conv1x1 task owns at a time: its tile is `PB x c_in` and its
+/// accumulator is `PB`. Public because `memguard` models the per-task scratch
+/// this number sets, and a copy of it over there would be a second place to
+/// change when this one moves.
+pub const PB: usize = 256;
+
 fn serial() -> bool {
     SERIAL.load(Ordering::Relaxed)
 }
@@ -629,7 +635,6 @@ impl<'a> Ctx<'a> {
                 //
                 // The accumulation order is untouched - every output element starts at
                 // its bias and adds `ic` ascending - so the output is bit-identical.
-                const PB: usize = 256;
                 let (d, s) = io2(arena, dp, c_out * plane, sd, c_in * plane);
                 // The task count is `plane / PB` clamped to the pool, NOT the
                 // element-count rule `nparts` uses: `nparts(17920)` is 1, so

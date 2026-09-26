@@ -86,7 +86,7 @@ template <int TX, int TY, int PXT>
 __device__ __forceinline__ void c3_body(
     const float *__restrict__ in, const float *__restrict__ wt,
     const float *__restrict__ bias, float *__restrict__ out,
-    int c_in, int c_out, int h, int wd, int x0)
+    int c_in, int c_out, int h, int wd, int x0, int segs)
 {
     constexpr int LOC = TY * 4;             // output channels per block
     constexpr int PX = TX * PXT;            // output pixels per block
@@ -110,9 +110,23 @@ __device__ __forceinline__ void c3_body(
     // 64-column segments of a row are no longer adjacent in launch order (the L2
     // reads a row's neighbours together). A division is much cheaper than that, so
     // the segment is recovered here rather than given its own axis.
-    const int per_row = gridDim.y / h;      // segments per row
-    const int y0 = blockIdx.y / per_row;
-    const int seg = blockIdx.y % per_row;
+    // THE SLOW INDEX IS (z, y) FLATTENED, because one dimension is not enough:
+    // gridDim.y is capped at 65535 and the level-0 conv3x3 of a 2048x2048 image
+    // wants h * segs = 2048 * 32 = 65536 blocks, one past the limit. `segs` comes
+    // from the host rather than from `gridDim.y / h` for the same reason the flat
+    // layout is kept wherever it fits: the fold above measures 11% slower when
+    // segments go on an axis of their own, so the two layouts coexist and only
+    // the host knows which one it launched.
+    //
+    // The split is a ceiling, so `y0` can land past the last row; those blocks
+    // must do nothing rather than write past the plane. With the flat layout
+    // (z == 0) the guard is never true, so nothing about a size that already
+    // worked changes.
+    const int slow = blockIdx.z * gridDim.y + blockIdx.y;
+    const int per_row = segs;               // segments per row
+    const int y0 = slow / per_row;
+    const int seg = slow % per_row;
+    if (y0 >= h) return;
     const int tx = threadIdx.x, ty = threadIdx.y;
     const int tid = ty * TX + tx;
     const int sx0 = x0 + seg * PX;
@@ -221,9 +235,9 @@ __device__ __forceinline__ void c3_body(
 extern "C" __global__ void __launch_bounds__(256, 3) mx_conv3x3_t4(
     const float *__restrict__ in, const float *__restrict__ wt,
     const float *__restrict__ bias, float *__restrict__ out,
-    int c_in, int c_out, int h, int wd, int x0)
+    int c_in, int c_out, int h, int wd, int x0, int segs)
 {
-    c3_body<16, 16, 4>(in, wt, bias, out, c_in, c_out, h, wd, x0);
+    c3_body<16, 16, 4>(in, wt, bias, out, c_in, c_out, h, wd, x0, segs);
 }
 
 // 2 pixels per thread: 32 channels per block, 32x8 threads, for c_out < 64.
@@ -242,9 +256,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) mx_conv3x3_t4(
 extern "C" __global__ void __launch_bounds__(256, 3) mx_conv3x3_t2(
     const float *__restrict__ in, const float *__restrict__ wt,
     const float *__restrict__ bias, float *__restrict__ out,
-    int c_in, int c_out, int h, int wd, int x0)
+    int c_in, int c_out, int h, int wd, int x0, int segs)
 {
-    c3_body<32, 8, 2>(in, wt, bias, out, c_in, c_out, h, wd, x0);
+    c3_body<32, 8, 2>(in, wt, bias, out, c_in, c_out, h, wd, x0, segs);
 }
 
 // A WIDE SEGMENT: 128 output columns per block instead of 64, and the geometry is
@@ -285,9 +299,9 @@ extern "C" __global__ void __launch_bounds__(256, 3) mx_conv3x3_t2(
 extern "C" __global__ void __launch_bounds__(256, 4) mx_conv3x3_w4(
     const float *__restrict__ in, const float *__restrict__ wt,
     const float *__restrict__ bias, float *__restrict__ out,
-    int c_in, int c_out, int h, int wd, int x0)
+    int c_in, int c_out, int h, int wd, int x0, int segs)
 {
-    c3_body<32, 8, 4>(in, wt, bias, out, c_in, c_out, h, wd, x0);
+    c3_body<32, 8, 4>(in, wt, bias, out, c_in, c_out, h, wd, x0, segs);
 }
 
 // 1x1 conv over a TRANSPOSED weight, `[c_in][c_out]` - this engine's own
@@ -1117,7 +1131,13 @@ extern "C" __global__ void mx_resize_axis(
     const int fast_n = (axis == 2) ? n_out : rows;
     const int slow_n = (axis == 2) ? c * hin : c * hout;
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
-    const int s = blockIdx.y * blockDim.y + threadIdx.y;
+    // (z, y) FLATTENED, for the same reason conv3x3 does it: gridDim.y is capped
+    // at 65535 and the horizontal pass of a 2048x2048 image wants
+    // c * hin / 4 = 65536 blocks on the slow axis. This kernel only ever uses `s`
+    // as an index and guards it, so the split needs no exactness - any
+    // y * z * blockDim.y >= slow_n will do, and with z == 0 the index is the one
+    // the flat grid produced.
+    const int s = (blockIdx.z * gridDim.y + blockIdx.y) * blockDim.y + threadIdx.y;
     if (f >= fast_n || s >= slow_n) return;
     int ch, g, o;
     if (axis == 2) { ch = s / rows; g = s - ch * rows; o = f; }

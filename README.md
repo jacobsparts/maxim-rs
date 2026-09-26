@@ -31,6 +31,9 @@ maxim -m maxim-lol.safetensors -i dark.png -o bright.png
   header, so there is no variant flag to get wrong. See Choosing a checkpoint.
 * Fast on both backends: 0.72 s on a GTX 1080 and 5.8 s on 24 CPU threads for a
   600x400 image, against 7.7 s for the PyTorch reference.
+* Sizes the pass before it starts it. The whole feature map is resident at once,
+  so the footprint is arithmetic on the input size, and a pass that will not fit
+  is refused with the numbers instead of failing half-way through. See Memory.
 
 ## Download
 
@@ -134,6 +137,54 @@ The input is padded up to a multiple of 64 and the result cropped back, so the
 output has the input's dimensions. That padding is what the upstream evaluation
 script does, and it is not cosmetic: each stage downsamples, and the gMLP blocks
 need the feature map to be a multiple of their 8-to-16 pixel block size.
+
+## Memory
+
+The whole feature map is resident at once on whichever backend runs, so there is
+no tiling mode and no trade of memory for time: the footprint follows the input
+and the stage count, and it is a plan total that every run prints.
+
+```
+maxim: plan 1840 ops, 2089 buffers, arena 7359.0 MiB, weights 86.7 MiB, built in 0.04s
+maxim: arena 7359 MiB (2089 buffers), weights up to 86 MiB, 8003 MiB free
+```
+
+The arena is ONE allocation, packed by buffer live range, so the number above is
+exactly what the driver is about to be asked for rather than an estimate of what
+the graph might use. When that does not fit, the pass is refused before anything
+is allocated, and the refusal says what it needed and what there was:
+
+```console
+$ maxim -m maxim-lol.safetensors -i 4096.png -o out.png
+maxim: arena 29436 MiB (2089 buffers), weights up to 86 MiB, 8003 MiB free
+maxim: not enough device memory for a 4096x4096 pass
+maxim: the arena needs 29436 MiB and the weights up to 86 MiB; 8003 MiB is free
+maxim: the arena is exact - it is the plan's own packed size, not an estimate - so this is a hard limit, not a guess
+maxim: a smaller image, a lighter checkpoint, or a freer card is what fits
+```
+
+There is deliberately no fallback from the GPU to the CPU on a memory failure. A
+silent switch to a multi-gigabyte host allocation is worse than an error, because
+a machine short of RAM does not fail, it swaps. The only thing that sends a run to
+the CPU is a driver that cannot be brought up - which is the whole point of one
+binary carrying both backends - and `--gpu` turns even that into an error.
+
+The CPU backend holds the same arena in host memory, so it is guarded the same
+way against what the machine has available:
+
+```console
+$ maxim -m maxim-lol.safetensors -i 4096.png -o out.png --cpu
+maxim: cpu plan 31305 MiB (arena 29436 + weights 173 + scratch 144, plus 5% slack), 20615 MiB available
+maxim: not enough memory for a 4096x4096 pass on the CPU
+...
+```
+
+For scale, on a 8 GB card: 640x480 needs 539 MiB of arena, 1280x853 1869 MiB,
+2048x1362 5059 MiB and 2048x2048 7359 MiB - so the largest image the Pixeldeck
+editor produces fits with room to spare. A larger card is not the only lever: the
+two-stage checkpoints (enhancement, deraining, dehazing) need about half of what
+the three-stage ones (denoising, deblurring) do at the same size, because the
+extra stage keeps another full-resolution activation alive.
 
 ## Accuracy
 

@@ -226,7 +226,21 @@ fn run(
     }
 
     let t0 = Instant::now();
-    let plan = Builder::new(&w, cfg).build(padded.img.h, padded.img.w)?;
+    // A RELEASE BUILD DOES NOT CARRY THE DUMP BUFFERS. Naming an activation pins
+    // it to the end of the run, because that is when `--dump` snapshots it - and
+    // 43 names held to the end of an 1840-op graph is not a detail: it is the
+    // difference between an arena of 7871 MiB and one of 5411 MiB at 2048x2048,
+    // 2.01x the graph's true live set against 1.15x. `--dump` is a development
+    // flag that a release binary refuses BY NAME, so a release build was paying
+    // that memory for a feature it does not contain. `tests/packing.rs` is what
+    // makes the swap safe: it runs the same graph with and without the names and
+    // demands a bit-identical result.
+    let b = Builder::new(&w, cfg);
+    #[cfg(feature = "dev")]
+    let b = if dump.is_some() { b } else { b.without_dumps() };
+    #[cfg(not(feature = "dev"))]
+    let b = b.without_dumps();
+    let plan = b.build(padded.img.h, padded.img.w)?;
     if !quiet {
         eprintln!(
             "maxim: plan {} ops, {} buffers, arena {:.1} MiB, weights {:.1} MiB, built in {:.2}s",
@@ -238,12 +252,59 @@ fn run(
         );
     }
 
-    // The full host arena is only needed where the host actually holds the
+    // ------------------------------------------------------------- the backend
+    //
+    // WHICH BACKEND RUNS IS DECIDED BEFORE THE HOST ARENA IS SIZED, and the order
+    // is load-bearing. A GPU run reads exactly one thing out of the host arena -
+    // the input image - and the device executes off its own copy, so allocating
+    // the other 942.7 MiB would be memory and page-fault time spent so that
+    // nothing can read it. A CPU run executes off the whole arena. Sizing the
+    // host arena from the device NAME alone, before knowing whether the GPU can
+    // actually be brought up, is how a fallback turns into a panic instead of a
+    // slow run: the CPU backend then reads past the end of a buffer that was
+    // never allocated.
+    //
+    // ONLY THE DRIVER FAILING TO COME UP SENDS A RUN TO THE CPU. That case is the
+    // whole reason one binary carries both backends - a machine with no NVIDIA
+    // driver must still work - and it is not an error unless the caller named the
+    // GPU. A pass that fails for any other reason is REPORTED; see the run below.
+    // A CPU-only build has no GPU branch at all, so naming the GPU is answered
+    // with that fact rather than by running the CPU engine and reporting the
+    // performance of something the caller did not ask for.
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = force_gpu;
+        if device == "gpu" {
+            return Err("this build has no cuda feature; use --device cpu".into());
+        }
+    }
+    // A CPU-only build cannot reach the GPU, so its answer is the one that needs
+    // no driver probe. The two bindings are the same name because everything
+    // below asks the same question of it.
+    #[cfg(not(feature = "cuda"))]
+    let use_cpu = true;
+    #[cfg(feature = "cuda")]
+    let use_cpu = if device != "gpu" {
+        true
+    } else {
+        match maxim::exec_gpu::driver_ready() {
+            Ok(()) => false,
+            Err(e) if force_gpu => return Err(e),
+            Err(e) => {
+                // NOT PROGRESS OUTPUT, SO `--quiet` DOES NOT SILENCE IT. Which
+                // backend ran is a property of the result, like a warning, and a
+                // caller that asked for quiet to keep its logs small still needs
+                // to know it got the CPU.
+                eprintln!("maxim: cuda: {e}");
+                eprintln!("maxim: falling back to the CPU backend (--gpu forces the GPU)");
+                true
+            }
+        }
+    };
+
+    // The full host arena is needed wherever the host actually holds the
     // activations: the CPU backend, the per-op verify walk, and a dump (which
-    // reads named activations out of it). A plain GPU run reads exactly one thing
-    // from the host arena - the input image - and the device executes off its own
-    // copy, so allocating the other 942.7 MiB would be memory and page-fault time
-    // spent so that nothing can read it. Only a development build can reach the
+    // reads named activations out of it). Only a development build can reach the
     // two paths that ask for the full length.
     let want_full_arena = {
         #[cfg(feature = "dev")]
@@ -255,11 +316,20 @@ fn run(
             false
         }
     };
-    let host_arena_len = if device == "cpu" || want_full_arena {
+    let host_arena_len = if use_cpu || want_full_arena {
         plan.arena_len
     } else {
         plan.offs[plan.input] + plan.bufs[plan.input].len()
     };
+    if use_cpu {
+        // THE CPU BACKEND IS THE LAST ONE, SO IT REFUSES RATHER THAN FAILING.
+        // There is nothing below it to fall back to, and a pass that runs a
+        // machine out of RAM does not fail - it swaps. So the footprint is
+        // computed and compared against what the machine has BEFORE the arena is
+        // allocated, the same way the GPU side compares its plan against free
+        // VRAM; a refusal therefore costs nothing.
+        maxim::memguard::check(&plan)?;
+    }
     let mut host = Host::with_arena_len(plan, host_arena_len);
     #[cfg(feature = "dev")]
     if std::env::var_os("MAXIM_TRACE").is_some() {
@@ -292,39 +362,30 @@ fn run(
     // gone from a release binary rather than merely unreachable in it.
     #[cfg(feature = "dev")]
     let mut cpu_timeline: Option<(Vec<f32>, f32)> = None;
-    match device {
-        #[cfg(feature = "dev")]
-        "cpu" if profile => {
-            // Per-op HOST timing, the same census the GPU backend gets from
-            // CUDA events. `step` is the call the op-by-op verify walk already
-            // uses, so the profile runs the plan the way that path does instead
-            // of through a second implementation of the loop.
-            let n = host.plan.ops.len();
-            let mut ms = vec![0.0f32; n];
-            let t = Instant::now();
-            for i in 0..n {
-                let t0 = Instant::now();
-                maxim::exec_cpu::step(&host.plan, &host.weights, &mut host.arena, i);
-                ms[i] = t0.elapsed().as_secs_f32() * 1000.0;
-            }
-            cpu_timeline = Some((ms, t.elapsed().as_secs_f32() * 1000.0));
+    #[cfg(feature = "dev")]
+    if use_cpu && profile {
+        // Per-op HOST timing, the same census the GPU backend gets from CUDA
+        // events. `step` is the call the op-by-op verify walk already uses, so
+        // the profile runs the plan the way that path does instead of through a
+        // second implementation of the loop.
+        let n = host.plan.ops.len();
+        let mut ms = vec![0.0f32; n];
+        let t = Instant::now();
+        for i in 0..n {
+            let t0 = Instant::now();
+            maxim::exec_cpu::step(&host.plan, &host.weights, &mut host.arena, i);
+            ms[i] = t0.elapsed().as_secs_f32() * 1000.0;
         }
-        "cpu" => maxim::exec_cpu::run(&host.plan, &host.weights, &mut host.arena),
-        _ => {}
+        cpu_timeline = Some((ms, t.elapsed().as_secs_f32() * 1000.0));
+    } else if use_cpu {
+        maxim::exec_cpu::run(&host.plan, &host.weights, &mut host.arena);
+    }
+    #[cfg(not(feature = "dev"))]
+    if use_cpu {
+        maxim::exec_cpu::run(&host.plan, &host.weights, &mut host.arena);
     }
 
-    // A CPU-only build has no GPU branch at all, so naming the GPU is answered
-    // with that fact rather than by running the CPU engine and reporting the
-    // performance of something the caller did not ask for. It also has no
-    // fallback to refuse, so it does not read `force_gpu`.
-    #[cfg(not(feature = "cuda"))]
-    let _ = force_gpu;
-    #[cfg(not(feature = "cuda"))]
-    if device == "gpu" {
-        return Err("this build has no cuda feature; use --device cpu".into());
-    }
-
-    let out_data: Vec<f32> = if device == "cpu" {
+    let out_data: Vec<f32> = if use_cpu {
         let (o, n) = (host.plan.offs[host.plan.output], host.plan.bufs[host.plan.output].len());
         host.arena[o..o + n].to_vec()
     } else {
@@ -338,26 +399,18 @@ fn run(
                 false
             }
         };
-        match run_gpu(&mut host, profile, quiet, want_arena) {
-            Ok(v) => v,
-            // NAMING THE GPU IS A REQUEST; NOT NAMING IT IS NOT. gpu is the
-            // default, so a machine with no driver must still work: the driver
-            // failing to come up is not an error unless the caller asked for the
-            // GPU by name.
-            Err(e) if force_gpu => return Err(e),
-            Err(e) => {
-                // NOT PROGRESS OUTPUT, SO `--quiet` DOES NOT SILENCE IT. Which
-                // backend ran is a property of the result, like a warning, and a
-                // caller that asked for quiet to keep its logs small still needs
-                // to know it got the CPU.
-                eprintln!("maxim: cuda: {e}");
-                eprintln!("maxim: falling back to the CPU backend (--gpu forces the GPU)");
-                maxim::exec_cpu::run(&host.plan, &host.weights, &mut host.arena);
-                let (o, n) =
-                    (host.plan.offs[host.plan.output], host.plan.bufs[host.plan.output].len());
-                host.arena[o..o + n].to_vec()
-            }
-        }
+        // A FAILED PASS IS NOT RETRIED ON THE CPU, AND THAT IS DELIBERATE. It
+        // was, until this commit. A large image wants more VRAM than the card
+        // has, so a memory failure switched to the CPU backend and finished the
+        // job - which hid the reason, and the reason is that the image does not
+        // fit, which the caller can act on. It also moved the failure somewhere
+        // worse: the CPU twin holds the whole arena in host RAM, and a machine
+        // short of memory swaps rather than erroring. It did not even work, in
+        // the end - the host arena was sized for a GPU run, so the CPU backend
+        // read past its end and panicked. `exec_gpu::Gpu::new` now sizes the
+        // pass and refuses one that cannot fit, with the numbers, before it
+        // allocates anything at all.
+        run_gpu(&mut host, profile, quiet, want_arena)?
     };
 
     let secs = t1.elapsed().as_secs_f64();

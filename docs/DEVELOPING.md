@@ -72,10 +72,10 @@ runs - it is a plan total, and every run prints it:
 
 | input | variant | plan | arena | weights |
 |---|---|---|---|---|
-| 256x256 | S-2 | 1840 ops, 2089 buffers | 215.5 MiB | 86.7 MiB |
-| 256x256 | S-3 | 2885 ops, 3276 buffers | 291.0 MiB | 135.2 MiB |
-| 640x448 (600x400 padded) | S-2 | 1840 ops | 942.7 MiB | 86.7 MiB |
-| 704x768 (669x760 padded) | S-3 | 2885 ops | 2400.6 MiB | 135.2 MiB |
+| 256x256 | S-2 | 1840 ops, 2089 buffers | 115.0 MiB | 86.7 MiB |
+| 256x256 | S-3 | 2885 ops, 3276 buffers | 115.0 MiB | 135.2 MiB |
+| 640x448 (600x400 padded) | S-2 | 1840 ops | 503.1 MiB | 86.7 MiB |
+| 704x768 (669x760 padded) | S-3 | 2885 ops | 948.6 MiB | 135.2 MiB |
 
 `weights` is the resident bytes after the loader's layout transposes, which is
 why it is larger than the file: a checkpoint is 54.1 MiB (S-2) or 84.7 MiB (S-3)
@@ -83,6 +83,43 @@ of tensor data, and the transposed copies of the convolutions are what the
 kernels read. There is no tiling mode to trade memory for time, so a large image
 needs a correspondingly large card; the CPU path allocates the same arena on the
 host, and it is only the GPU's copy that a plain GPU run can skip.
+
+### Where the arena went
+
+It was twice this, and the two things that took it down are worth keeping in
+mind, because both were invisible until the arena was measured against something.
+
+**The dump names were most of it.** `rec` names an activation, and the packer
+extends a named buffer's last use to the end of the run so `--dump` can snapshot
+it after every op has run. 43 names held to the end of an 1840-op graph cost more
+than the graph's own peak live set - 2.01x it, at every size tested - and `--dump`
+is a `--features dev` flag that a release build refuses BY NAME, so a release
+build was paying that memory for a feature it does not contain. A release build
+now plans with `without_dumps()`, and `tests/arena.rs` asserts both halves of
+that: the arena stays near the live set, and naming activations is still what
+costs the memory.
+
+**The packing order was the rest.** Placing buffers in first-use order - the
+obvious choice, and what it did - leaves the arena at 1.15x the live-set peak.
+Placing the LARGEST buffers first, with first-use as the tie-break, brings it to
+1.07x: a large buffer placed late has to go past everything already placed, and
+the gaps it leaves behind are too small for the buffers that come after it. Adding
+the space below each placed block to the candidate list was also tried; measured
+at four sizes it changed nothing, so it is not there.
+
+The figures, at 2048x2048 with `maxim-lol`:
+
+| | arena |
+|---|---|
+| names held to the end of the run, first-use order | 13791.0 MiB |
+| no names, first-use order | 7871.0 MiB |
+| no names, largest first | 7359.0 MiB |
+| the graph's true live-set peak | 6847.0 MiB |
+
+`tests/arena.rs` computes that peak - following each buffer's alias chain to the
+storage that owns its bytes, taking first and last use from `Op::operands`, and
+sweeping the live set over the op list - so the ratio is asserted rather than
+remembered.
 
 The input is padded up to a multiple of 64 and the result cropped back, so the
 output has the input's dimensions. That is what the upstream evaluation script
@@ -233,10 +270,13 @@ tools/           conversion, the PyTorch reference, the diff and the eval set
 ## The plan is packed
 
 Buffers are allocated by live range, not by name: a buffer's slot is reused once
-its previous occupant is dead. `tests/packing.rs` checks that the packed plan is
-the size it claims, that no op overlaps its own inputs, and that recording a dump
-(the only thing that changes what is live to the end of the run) does not change
-the result.
+its previous occupant is dead, and the largest buffers are placed first (see
+Sizes and memory for what that ordering is worth). `tests/packing.rs` checks that
+the packed plan is the size it claims, that no op overlaps its own inputs, and
+that recording a dump (the only thing that changes what is live to the end of the
+run) does not change the result. `tests/arena.rs` checks the arena against the
+graph's true live-set peak, which is the number that says whether the packing is
+doing its job at all.
 
 ## Parity tooling
 

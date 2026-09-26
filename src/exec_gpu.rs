@@ -71,11 +71,82 @@ pub struct Timeline {
     pub total_ms: f32,
 }
 
+/// Bring the CUDA driver up.
+///
+/// THIS IS THE ONLY THING THAT MAY SEND A RUN TO THE CPU BACKEND. A machine with
+/// no NVIDIA driver must still work - that is what one binary for both backends
+/// buys - and a driver that will not come up is not an error unless the caller
+/// named the GPU. A pass that fails for any other reason is REPORTED, never
+/// retried on the CPU; see `Gpu::new` below and the run in `main`.
+pub fn driver_ready() -> Result<(), Error> {
+    lightgpu::vm::init().map_err(Error)
+}
+
 impl Gpu {
+    /// The device arena, the weight cache and the small pool.
+    ///
+    /// THE PASS IS SIZED BEFORE IT IS ALLOCATED, AND REFUSED IF IT WILL NOT FIT.
+    /// `plan.arena_len` is the packed arena the plan's own liveness pass
+    /// computed, and the arena is a single allocation this engine makes itself,
+    /// so the number printed below is the number the driver is about to be asked
+    /// for - exact, not a model of what the graph might use. That is what makes
+    /// a refusal honest rather than a guess, and refusing is what happens here:
+    /// the alternative is `cuMemAlloc failed` half a second into a launch, with
+    /// nothing said about what would have fitted.
     pub fn new(plan: &Plan) -> Result<Gpu, Error> {
+        let cuda = Cuda::new()?;
+        let arena_bytes = plan.arena_bytes();
+        let weight_bytes = plan.weight_bytes();
+        // A free-VRAM query that fails is NOT a reason to refuse: the driver is
+        // already up (the line above brought it up), so this is a courtesy that
+        // is occasionally unavailable, and running an unguarded pass beats
+        // refusing every pass on a machine where one ioctl moved.
+        let free = lightgpu::vm::free_vram().unwrap_or(usize::MAX);
+        eprintln!(
+            "maxim: arena {} MiB ({} buffers), weights up to {} MiB, {} MiB free",
+            arena_bytes / 1048576,
+            plan.bufs.len(),
+            weight_bytes / 1048576,
+            free / 1048576
+        );
+        if arena_bytes + weight_bytes > free {
+            return Err(format!(
+                "not enough device memory for a {}x{} pass\n\
+                 maxim: the arena needs {} MiB and the weights up to {} MiB; {} MiB is free\n\
+                 maxim: the arena is exact - it is the plan's own packed size, not an estimate - so this is a hard limit, not a guess\n\
+                 maxim: a smaller image, a lighter checkpoint, or a freer card is what fits",
+                plan.shape.w,
+                plan.shape.h,
+                arena_bytes / 1048576,
+                weight_bytes / 1048576,
+                free / 1048576
+            )
+            .into());
+        }
+        let arena = Buf::new(plan.arena_len).map_err(|e: Error| {
+            // THE CHECK ABOVE CAN PASS AND THE ALLOCATION STILL FAIL. Free VRAM
+            // is a total, and the driver has to find one CONTIGUOUS run for the
+            // arena, so a failure here is reported with the same numbers plus
+            // the one fact that distinguishes it - rather than as a bare
+            // `cuMemAlloc failed`, which says nothing about the size that was
+            // asked for.
+            if e.0.contains("OUT_OF_MEMORY") {
+                Error(format!(
+                    "the arena for {}x{} ({} MiB) did not fit after all, with {} MiB free\n\
+                     maxim: {e}\n\
+                     maxim: free VRAM is a total, and the arena needs one contiguous run, so a fragmented card can refuse a plan the total says fits",
+                    plan.shape.w,
+                    plan.shape.h,
+                    arena_bytes / 1048576,
+                    free / 1048576
+                ))
+            } else {
+                e
+            }
+        })?;
         Ok(Gpu {
-            cuda: Cuda::new()?,
-            arena: Buf::new(plan.arena_len)?,
+            cuda,
+            arena,
             pool: SmallPool::new(),
             weights: WeightCache::new(plan.weights.len()),
             launched: 0,
@@ -491,16 +562,15 @@ impl Gpu {
                 } else {
                     ("mx_conv3x3_t2", 32, 8, 32usize)
                 };
-                args.i32(0);
-                // The segments go on `y`, folded with the rows, because that is
-                // where `c3_body` looks for them: it computes
-                // `per_row = gridDim.y / h` and then divides and takes the
-                // remainder to recover the row and the segment. Launching the
-                // segments on `z` instead leaves `per_row` at 1, so every block
-                // runs segment 0 and the right-hand part of every row is never
-                // written - which is silent, because the arena happens to be
-                // reusable memory. `MAXIM_POISON=1` is what catches it.
-                let grid = (c_out.div_ceil(loc).max(1) as u32, (h.max(1) * segs) as u32, 1);
+                // `segs` is passed rather than left for the kernel to recover
+                // from `gridDim.y / h`: the segments are folded into `y` where
+                // that fits, because a segment on an axis of its own measures 11%
+                // slower (see the kernel's comment), and at 2048x2048 the folded
+                // count is one block past what a grid dimension allows - so the
+                // two layouts coexist and only this side knows which one ran.
+                args.i32(0).i32(segs as i32);
+                let (gy, gz) = slow_grid(h.max(1) * segs);
+                let grid = (c_out.div_ceil(loc).max(1) as u32, gy, gz);
                 self.go(name, grid, (bx, by, 1), plan, &mut args)?;
             }
             Op::Conv4x4s2 { dst, src, w, bias, c_in, c_out, h, wd, pad_top, pad_left, oh, ow } => {
@@ -645,13 +715,15 @@ impl Gpu {
                 args.ptr(s).ptr(t)
                     .i32(c as i32).i32(hin as i32).i32(win as i32).i32(hout as i32).i32(wout as i32)
                     .i32((hin * win) as i32).i32((hin * wout) as i32).i32(2);
-                let g = ((wout as u32).div_ceil(RB), ((c * hin) as u32).div_ceil(RC), 1);
+                let (gy, gz) = slow_grid((c * hin).div_ceil(RC as usize));
+                let g = ((wout as u32).div_ceil(RB), gy, gz);
                 self.go("mx_resize_axis", g, (RB, RC, 1), plan, &mut args)?;
                 let mut args = Args::new();
                 args.ptr(t).ptr(d)
                     .i32(c as i32).i32(hin as i32).i32(wout as i32).i32(hout as i32).i32(wout as i32)
                     .i32((hin * wout) as i32).i32((hout * wout) as i32).i32(1);
-                let g = ((wout as u32).div_ceil(RB), ((c * hout) as u32).div_ceil(RC), 1);
+                let (gy, gz) = slow_grid((c * hout).div_ceil(RC as usize));
+                let g = ((wout as u32).div_ceil(RB), gy, gz);
                 self.go("mx_resize_axis", g, (RB, RC, 1), plan, &mut args)?;
             }
             Op::DownS { dst, src, c, h, wd, stride, off, oh, ow } => {
@@ -669,6 +741,28 @@ impl Gpu {
     fn go(&mut self, kernel: &str, grid: (u32, u32, u32), block: (u32, u32, u32), _plan: &Plan, args: &mut Args) -> Result<(), Error> {
         self.kernels += 1;
         self.cuda.launch(kernel, grid, block, args)
+    }
+}
+
+/// A slow grid dimension split across `y` and `z`.
+///
+/// BOTH ARE CAPPED AT 65535 BLOCKS, and this model exceeds that at 2048x2048:
+/// the horizontal resize wants `c * hin / 4` = 65536 blocks on the slow axis, and
+/// the level-0 conv3x3 wants `h * segs` = 2048 * 32 = 65536. The failure is loud
+/// - `CUDA_ERROR_INVALID_VALUE` at the launch, with the grid printed - but it was
+/// unreachable until the arena stopped being the thing that failed first, so it
+/// had never run.
+///
+/// The two kernels that can overflow read the slow index as
+/// `blockIdx.z * gridDim.y + blockIdx.y`, which is the number the flat grid gave
+/// whenever the flat grid fit (`z` is 0), so no launch geometry changes for a
+/// size that already worked.
+fn slow_grid(n: usize) -> (u32, u32) {
+    const MAX: usize = 65535;
+    if n <= MAX {
+        (n.max(1) as u32, 1)
+    } else {
+        (MAX as u32, n.div_ceil(MAX) as u32)
     }
 }
 

@@ -1150,13 +1150,33 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Offsets, in first-use order. Candidate offsets are the boundaries of
-        // everything already placed; the first candidate whose block does not
-        // overlap a block that is still live during [first, last] wins. This is
-        // not optimal (an optimal packing is NP-hard) but it is one pass and it
-        // gets the arena down to a few planes per level, which is what matters.
+        // Offsets. Candidate offsets are the boundaries of everything already
+        // placed; the first candidate whose block does not overlap a block that is
+        // still live during [first, last] wins. This is not optimal (an optimal
+        // packing is NP-hard) but it is one pass and it gets the arena down to a
+        // few planes per level, which is what matters.
+        //
+        // THE ORDER IS WORTH MORE THAN THE CANDIDATE RULE, and it is worth saying
+        // how much, because the obvious choice is the wrong one. Placing in
+        // first-use order - what this did until the arena stopped being the thing
+        // that failed first - leaves the arena at 1.15x the graph's true live-set
+        // peak. Placing the LARGEST buffers first, with first-use as the
+        // tie-break, brings it to 1.07x: a large buffer placed late has to go past
+        // everything already placed, and the gaps it leaves behind are too small
+        // for the buffers that come after it. At 2048x2048 that is 7871 MiB
+        // against 7359, where the peak itself is 6847.
+        //
+        // The space BELOW each placed block was also tried as a candidate, on the
+        // theory that it lets a small buffer into a gap. Measured at all four
+        // sizes it changed nothing, so it is not here.
         let mut order: Vec<usize> = (0..n).filter(|&i| base[i] == i && first[i] != usize::MAX - 1).collect();
-        order.sort_by_key(|&i| first[i]);
+        // Largest first, first-use as the tie-break so the order is deterministic.
+        order.sort_by(|&a, &b| {
+            self.bufs[b]
+                .len()
+                .cmp(&self.bufs[a].len())
+                .then_with(|| first[a].cmp(&first[b]))
+        });
         struct Block {
             start: usize,
             end: usize,

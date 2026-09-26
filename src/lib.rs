@@ -17,6 +17,7 @@ pub mod exec_cpu;
 pub mod exec_gpu;
 pub mod host;
 pub mod image;
+pub mod memguard;
 pub mod model;
 pub mod weights;
 
