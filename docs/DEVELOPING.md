@@ -186,11 +186,10 @@ own PNGs score against the ground truth, and it reproduces their published
 per-image tables exactly - 23.4346 for LOL, 38.1133 for RESIDE-Indoor. But those
 PNGs are floored, so they are on average half a level low, and `theirs, +0.5 LSB`
 adds that half level back before scoring. That column is the one to compare with:
-the engine is within 0.05 dB of it on all three (worst 0.044, RESIDE-Indoor),
-which is what a faithful
-reimplementation of the same graph and the same weights should be. Comparing the
-raw column instead would charge the engine for a rounding choice made in
-upstream's save function.
+the engine is within 0.05 dB of it on all three - worst 0.044, on RESIDE-Indoor -
+which is what a faithful reimplementation of the same graph and the same weights
+should be. Comparing the raw column instead would charge the engine for a
+rounding choice made in upstream's save function.
 
 Why the correction is needed at all: both of their scripts write with
 `(np.clip(x, 0., 1.) * 255.).astype(uint8)`, which TRUNCATES, while this engine
