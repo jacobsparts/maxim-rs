@@ -50,8 +50,13 @@ on the CPU; they differ only in whether CUDA support is compiled in.
 | 11 `maxim-*.safetensors` checkpoints | one per task and dataset | see Choosing a checkpoint |
 
 ```sh
+chmod +x maxim-linux-x86_64
 ./maxim-linux-x86_64 -m maxim-lol.safetensors -i dark.png -o bright.png
 ```
+
+The `chmod` is not decoration: a download does not carry the executable
+bit through, and a binary that has lost it fails with `Permission denied`
+before it can print anything.
 
 ## Build
 
