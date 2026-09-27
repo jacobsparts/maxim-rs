@@ -64,6 +64,33 @@ different order) and is not golden; the backends are held to 1e-3 relative by
 development tool. `tools/eval.py` runs a whole evaluation set through both and
 reports PSNR against the ground truth.
 
+### Per-op comparisons
+
+`--verify-gpu` compares an op against the SAME op on the other backend, which
+cannot answer "is this kernel the right one for this job". The examples do that:
+each one times this engine's kernel against the toolkit kernel that could replace
+it, with both buffers resident, ALTERNATING the two arms inside one clock window
+(this card's clock has been seen to swing by more than 10x between windows, so a
+ratio measured across two windows is not a measurement), and compares their
+outputs so the numerics are measured rather than assumed.
+
+```sh
+cargo run --release --example convt2x2
+```
+
+* `convt2x2` - the stride-2 2x2 transposed convolution, `mx_convt2x2s2` against
+  the toolkit's `lg_conv_t2x2`. THE ENGINE'S KERNEL STAYS: the two are bit-exact
+  at every shape, and the engine's is 1.39-2.22x faster at every geometry a MAXIM
+  pass reaches (1.54x at 896x1280 32->32, 2.22x at 448x640 64->64, 1.45x at
+  224x320 128->128, 1.64x summed). It loses only at a 64x64 input, 0.81x, where
+  the toolkit's smaller tile wins and no MAXIM pass goes. The toolkit's entry is
+  compiled in for the comparison and not launched by the graph; deleting it would
+  make the result unreproducible.
+
+An example rather than a `dev` flag because it can reach `maxim::cuda::Cuda` and
+load both fatbins directly (see the module doc in `src/cuda.rs`), so neither the
+executor nor the release binary's argument list is involved.
+
 ## Sizes and memory
 
 The whole feature map is resident at once on whichever backend runs, so the

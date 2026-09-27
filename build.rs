@@ -33,6 +33,16 @@ const TOOLKIT_KERNELS: &[&str] = &[
     // different and are the same op: an NCHW (c, h*w) tensor, and a gMLP tensor
     // in the blocked layout (c, grid*patch) whose channel axis is contiguous.
     "lg_channel_layer_norm",
+    // The toolkit's stride-2 2x2 TRANSPOSED convolution, the same operation as
+    // this engine's `mx_convt2x2s2`: weight `[c_in][c_out][2][2]`, output at
+    // `(2y+ky, 2x+kx)` with no tap flip, a nullable bias. Compiled in for the
+    // `examples/convt2x2.rs` comparison; the graph still launches the project
+    // kernel, and that measurement says it should: bit-exact, but 1.39-2.22x
+    // faster at every geometry this engine runs (and 0.81x at a 64x64 input,
+    // which no MAXIM pass reaches). The entry is kept because the example is the
+    // record of that, and because deleting it would make the comparison
+    // unreproducible.
+    "lg_conv_t2x2",
     // `lg_conv3x3s1p1` USED TO BE HERE and is deliberately gone. It was embedded
     // as the fallback for "a width the tiled kernel cannot tile", but no such
     // width exists: `c3_body` derives `ow` from `x0` in-kernel, so a row whose

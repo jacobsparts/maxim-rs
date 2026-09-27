@@ -58,6 +58,9 @@ pub const TOOLKIT_KERNELS: &[&str] = &[
     // `build.rs`. It is not in the fatbin either, so the startup check below
     // would fail if some op ever named it again, which is the point.
     "lg_channel_layer_norm",
+    // Resolved for `examples/convt2x2.rs` only - the transposed counterpart of
+    // this engine's `mx_convt2x2s2`, which is still what the graph launches.
+    "lg_conv_t2x2",
 ];
 
 pub struct Cuda {
