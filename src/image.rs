@@ -146,6 +146,20 @@ fn reflect_index(i: isize, n: usize) -> usize {
 /// factor` rounds up to the next multiple strictly above `h` when `h` is not
 /// already a multiple - and that the pad is split with a floor, which is why an
 /// odd `h` would lose a row. An even `h` cannot, so this is faithful either way.
+///
+/// A REFLECTION NEEDS THE PAD TO BE SMALLER THAN THE DIMENSION IT MIRRORS, and
+/// this is the reference's own precondition rather than this engine's choice:
+/// the pipeline is `torch.nn.functional.pad(..., mode="reflect")`, which raises
+/// `Padding size should be less than the corresponding input dimension` for the
+/// same input. It bites on the way UP to `factor`, where the pad is
+/// `ceil(h/64)*64 - h` split in two - so a 16x16 image is padded by 24 a side
+/// (24 >= 16) and an image just under the next multiple is padded by almost
+/// nothing. So an image can be TOO SMALL for this pipeline, and the reference
+/// refuses it; this used to index past the end of the plane and abort, which
+/// says nothing about what went wrong to anyone who sees it (a 16x16 PNG
+/// aborted with `index out of bounds: the len is 768 but the index is 920`).
+/// The refusal below is the same answer the reference gives, in this engine's
+/// voice.
 pub struct Padded {
     pub img: Image,
     pub orig_h: usize,
@@ -154,7 +168,7 @@ pub struct Padded {
     pub even_w: usize,
 }
 
-pub fn preprocess(img: &Image, factor: usize) -> Padded {
+pub fn preprocess(img: &Image, factor: usize) -> Result<Padded, Error> {
     let (h, w) = (img.h, img.w);
     let ph = h % 2;
     let pw = w % 2;
@@ -168,12 +182,47 @@ pub fn preprocess(img: &Image, factor: usize) -> Padded {
     let wp = if even_w % factor != 0 { ((even_w + factor) / factor) * factor } else { even_w };
     let padh = hp - even_h;
     let padw = wp - even_w;
+    // Both axes, named with their own numbers: a tall thin image can satisfy one
+    // and not the other, and the message has to say which.
+    for (axis, dim, pad) in [("height", even_h, padh / 2), ("width", even_w, padw / 2)] {
+        if pad != 0 && pad >= dim {
+            return Err(format!(
+                "this image is too small for MAXIM's {factor}-multiple padding: the {axis} is \
+                 {dim} pixels and the pipeline reflects it out to the next multiple of {factor}, \
+                 which is {pad} pixels of padding a side - a reflection needs less padding than \
+                 the dimension it mirrors. The reference pipeline refuses this input for the same \
+                 reason (torch's reflect pad: `Padding size should be less than the corresponding \
+                 input dimension`). Give it an image at least {min} pixels on its {axis}.",
+                min = min_dimension(factor),
+            )
+            .into());
+        }
+    }
     let padded = if padh != 0 || padw != 0 {
         reflect_pad2(&even, padh / 2, padh / 2, padw / 2, padw / 2)
     } else {
         even
     };
-    Padded { img: padded, orig_h: h, orig_w: w, even_h, even_w }
+    Ok(Padded { img: padded, orig_h: h, orig_w: w, even_h, even_w })
+}
+
+/// The smallest dimension this pipeline can pad by reflection, for the message.
+///
+/// Not a constant of the engine - it is the first even `d` under `factor` whose
+/// centred pad `(ceil(d/factor)*factor - d)/2` is smaller than `d`, which is
+/// `d > factor/3` rounded up to an even number: at `factor = 64` that is 22 (pad
+/// 21), where 20 would need 22 and 16 needs 24. Erring one step high in a
+/// message is harmless; the check itself is the exact `pad < dim`.
+fn min_dimension(factor: usize) -> usize {
+    let mut d = 2;
+    while d < factor {
+        let up = ((d + factor) / factor) * factor;
+        if (up - d) / 2 < d {
+            return d;
+        }
+        d += 2;
+    }
+    factor
 }
 
 pub fn copy(img: &Image) -> Image {

@@ -216,7 +216,7 @@ fn run(
         }
         Some(p) => image::read_png(p)?,
     };
-    let padded = image::preprocess(&img, factor);
+    let padded = image::preprocess(&img, factor)?;
     if !quiet {
         eprintln!(
             "maxim {VERSION}: {}x{} -> padded {}x{} (even {}x{}), {} stage(s), features {}",
